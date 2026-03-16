@@ -18,11 +18,23 @@ const asyncStorage = new AsyncLocalStorage<TraceContext>();
 /** Global exporter reference (set by Client). */
 let _exporter: BatchExporter | null = null;
 
+/** Client-level defaults (set by Client to avoid circular imports). */
+let _clientDefaults: { userId?: string; sessionId?: string } = {};
+
 /** Global tool registry for invocable tools. */
 const _toolRegistry = new Map<string, ToolRegistryEntry>();
 
 export function _setExporter(exporter: BatchExporter | null): void {
   _exporter = exporter;
+}
+
+export function _setClientDefaults(defaults: { userId?: string; sessionId?: string }): void {
+  _clientDefaults = defaults;
+}
+
+/** Get the current trace context (used by imperative API). */
+export function _getTraceContext(): TraceContext | undefined {
+  return asyncStorage.getStore();
 }
 
 export function _getToolRegistry(): Map<string, ToolRegistryEntry> {
@@ -57,6 +69,11 @@ export function trace<T extends (...args: any[]) => any>(
   const model = options.model ?? null;
   const staticMetadata = options.metadata ?? null;
   const invoke = options.invoke !== false; // default true
+  const usage = options.usage ?? null;
+
+  // Resolve userId/sessionId: per-trace option > client default
+  const userId = options.userId ?? _clientDefaults.userId;
+  const sessionId = options.sessionId ?? _clientDefaults.sessionId;
 
   // Register tool for remote invocation
   if (obsType === "tool" && invoke) {
@@ -88,41 +105,53 @@ export function trace<T extends (...args: any[]) => any>(
       const capturedInput = jsonSerializable(args.length === 1 ? args[0] : args);
 
       if (isRoot) {
+        const body: Record<string, unknown> = {
+          id: entityId,
+          name: obsName,
+          timestamp: startTime.toISOString(),
+          input: capturedInput,
+          output: jsonSerializable(output),
+          metadata: staticMetadata,
+        };
+        if (userId !== undefined) body.userId = userId;
+        if (sessionId !== undefined) body.sessionId = sessionId;
+
         const event: TraceEvent = {
           id: generateId(),
           type: "trace-create",
           timestamp: startTime.toISOString(),
-          body: {
-            id: entityId,
-            name: obsName,
-            timestamp: startTime.toISOString(),
-            input: capturedInput,
-            output: jsonSerializable(output),
-            metadata: staticMetadata,
-          },
+          body,
         };
         _exporter?.enqueue(event);
       } else {
         const createType = EVENT_TYPE_MAP[obsType!]?.[0] ?? "span-create";
+        const body: Record<string, unknown> = {
+          id: entityId,
+          traceId,
+          type: OBSERVATION_TYPE_ENUM[obsType!] ?? obsType,
+          name: obsName,
+          startTime: startTime.toISOString(),
+          endTime: endTime.toISOString(),
+          input: capturedInput,
+          output: jsonSerializable(output),
+          metadata: staticMetadata,
+          model,
+          level,
+          statusMessage,
+          parentObservationId,
+        };
+        // Add usage fields for generation observations
+        if (usage && obsType === "generation") {
+          if (usage.promptTokens !== undefined) body.promptTokens = usage.promptTokens;
+          if (usage.completionTokens !== undefined) body.completionTokens = usage.completionTokens;
+          if (usage.totalTokens !== undefined) body.totalTokens = usage.totalTokens;
+        }
+
         const event: TraceEvent = {
           id: generateId(),
           type: createType,
           timestamp: startTime.toISOString(),
-          body: {
-            id: entityId,
-            traceId,
-            type: OBSERVATION_TYPE_ENUM[obsType!] ?? obsType,
-            name: obsName,
-            startTime: startTime.toISOString(),
-            endTime: endTime.toISOString(),
-            input: capturedInput,
-            output: jsonSerializable(output),
-            metadata: staticMetadata,
-            model,
-            level,
-            statusMessage,
-            parentObservationId,
-          },
+          body,
         };
         _exporter?.enqueue(event);
       }

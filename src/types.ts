@@ -19,6 +19,13 @@ export const OBSERVATION_TYPE_ENUM: Record<string, string> = {
   chain: "CHAIN",
 };
 
+/** Token / cost tracking for generation observations. */
+export interface UsageDetails {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
 /** Options for the trace() wrapper. */
 export interface TraceOptions {
   /** Observation type. undefined = root trace. */
@@ -33,6 +40,12 @@ export interface TraceOptions {
   inputSchema?: { _def?: unknown };
   /** Static metadata attached to every call. */
   metadata?: Record<string, unknown>;
+  /** User ID for this trace/observation. */
+  userId?: string;
+  /** Session ID for this trace/observation. */
+  sessionId?: string;
+  /** Token usage for generation observations. */
+  usage?: UsageDetails;
 }
 
 /** A single event to be batched and sent to the ingestion endpoint. */

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { trace, _setExporter, _getToolRegistry } from "../src/trace.js";
+import { trace, _setExporter, _setClientDefaults, _getToolRegistry } from "../src/trace.js";
 import type { TraceEvent } from "../src/types.js";
 
 // Mock exporter that captures events
@@ -148,5 +148,86 @@ describe("trace() - custom name", () => {
     const fn = trace("original", { type: "span", name: "custom" }, () => null);
     fn();
     expect(mock.events[0].body.name).toBe("custom");
+  });
+});
+
+describe("trace() - session & user tracking", () => {
+  afterEach(() => {
+    _setClientDefaults({});
+  });
+
+  it("includes userId and sessionId on root traces when provided per-trace", () => {
+    const fn = trace("tracked", { userId: "user-1", sessionId: "sess-1" }, () => "ok");
+    fn();
+
+    expect(mock.events).toHaveLength(1);
+    expect(mock.events[0].body.userId).toBe("user-1");
+    expect(mock.events[0].body.sessionId).toBe("sess-1");
+  });
+
+  it("falls back to client-level defaults for userId/sessionId", () => {
+    _setClientDefaults({ userId: "default-user", sessionId: "default-sess" });
+    const fn = trace("tracked-default", () => "ok");
+    fn();
+
+    expect(mock.events[0].body.userId).toBe("default-user");
+    expect(mock.events[0].body.sessionId).toBe("default-sess");
+  });
+
+  it("per-trace userId/sessionId overrides client defaults", () => {
+    _setClientDefaults({ userId: "default-user", sessionId: "default-sess" });
+    const fn = trace("override", { userId: "override-user" }, () => "ok");
+    fn();
+
+    expect(mock.events[0].body.userId).toBe("override-user");
+    expect(mock.events[0].body.sessionId).toBe("default-sess");
+  });
+
+  it("omits userId/sessionId when not set", () => {
+    const fn = trace("no-tracking", () => "ok");
+    fn();
+
+    expect(mock.events[0].body.userId).toBeUndefined();
+    expect(mock.events[0].body.sessionId).toBeUndefined();
+  });
+});
+
+describe("trace() - usage tracking for generations", () => {
+  it("includes token usage in generation body", () => {
+    const fn = trace(
+      "gen-with-usage",
+      {
+        type: "generation",
+        model: "gpt-4o",
+        usage: { promptTokens: 10, completionTokens: 50, totalTokens: 60 },
+      },
+      () => "response",
+    );
+    fn();
+
+    expect(mock.events).toHaveLength(1);
+    expect(mock.events[0].body.promptTokens).toBe(10);
+    expect(mock.events[0].body.completionTokens).toBe(50);
+    expect(mock.events[0].body.totalTokens).toBe(60);
+  });
+
+  it("does not include usage for non-generation types", () => {
+    const fn = trace("span-with-usage", { type: "span", usage: { promptTokens: 10 } }, () => "ok");
+    fn();
+
+    expect(mock.events[0].body.promptTokens).toBeUndefined();
+  });
+
+  it("allows partial usage", () => {
+    const fn = trace(
+      "partial-usage",
+      { type: "generation", model: "gpt-4o-mini", usage: { totalTokens: 100 } },
+      () => "done",
+    );
+    fn();
+
+    expect(mock.events[0].body.totalTokens).toBe(100);
+    expect(mock.events[0].body.promptTokens).toBeUndefined();
+    expect(mock.events[0].body.completionTokens).toBeUndefined();
   });
 });

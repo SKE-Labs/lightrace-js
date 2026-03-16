@@ -11,9 +11,9 @@ yarn add lightrace
 ## Quick Start
 
 ```typescript
-import { LightRace, trace } from "lightrace";
+import { Lightrace, trace } from "lightrace";
 
-const lt = new LightRace({
+const lt = new Lightrace({
   publicKey: "pk-lt-demo",
   secretKey: "sk-lt-demo",
   host: "http://localhost:3002",
@@ -31,25 +31,23 @@ const search = trace("search", { type: "span" }, async (query: string) => {
 });
 
 // Generation (LLM call)
-const generate = trace("generate", { type: "generation", model: "gpt-4o" },
+const generate = trace(
+  "generate",
+  { type: "generation", model: "gpt-4o" },
   async (prompt: string) => {
     return "LLM response";
-  }
+  },
 );
 
-// Tool — remotely invocable from the LightRace UI
-const weatherLookup = trace("weather", { type: "tool" },
-  async (input: { city: string }) => {
-    return { temp: 72, unit: "F" };
-  }
-);
+// Tool — remotely invocable from the Lightrace UI
+const weatherLookup = trace("weather", { type: "tool" }, async (input: { city: string }) => {
+  return { temp: 72, unit: "F" };
+});
 
 // Tool — traced but NOT remotely invocable
-const readFile = trace("read-file", { type: "tool", invoke: false },
-  async (path: string) => {
-    return "file contents";
-  }
-);
+const readFile = trace("read-file", { type: "tool", invoke: false }, async (path: string) => {
+  return "file contents";
+});
 
 await runAgent("hello");
 lt.flush();
@@ -60,25 +58,25 @@ await lt.shutdown();
 
 ```typescript
 // Root trace (no options)
-trace(name, fn)
+trace(name, fn);
 
 // With options
-trace(name, options, fn)
+trace(name, options, fn);
 ```
 
 ### Options
 
-| Option        | Type      | Default     | Description                                             |
-| ------------- | --------- | ----------- | ------------------------------------------------------- |
+| Option        | Type      | Default     | Description                                              |
+| ------------- | --------- | ----------- | -------------------------------------------------------- |
 | `type`        | `string`  | `undefined` | `"span"`, `"generation"`, `"tool"`, `"chain"`, `"event"` |
-| `invoke`      | `boolean` | `true`      | For `type: "tool"`: register for remote invocation      |
-| `model`       | `string`  | `undefined` | For `type: "generation"`: LLM model name                |
-| `inputSchema` | `ZodType` | `undefined` | Optional Zod schema for tool input                      |
-| `metadata`    | `Record`  | `undefined` | Static metadata attached to every call                  |
+| `invoke`      | `boolean` | `true`      | For `type: "tool"`: register for remote invocation       |
+| `model`       | `string`  | `undefined` | For `type: "generation"`: LLM model name                 |
+| `inputSchema` | `ZodType` | `undefined` | Optional Zod schema for tool input                       |
+| `metadata`    | `Record`  | `undefined` | Static metadata attached to every call                   |
 
 ## Compatibility
 
-LightRace server also accepts traces from Langfuse Python/JS SDKs.
+Lightrace server also accepts traces from Langfuse Python/JS SDKs.
 
 ## Development
 

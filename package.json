@@ -9,6 +9,10 @@
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
+    },
+    "./integrations/langchain": {
+      "import": "./dist/integrations/langchain.js",
+      "types": "./dist/integrations/langchain.d.ts"
     }
   },
   "files": [
@@ -33,6 +37,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
+    "@langchain/core": "^1.1.32",
     "@types/node": "^22.0.0",
     "@types/ws": "^8.5.0",
     "eslint": "^9.0.0",
@@ -45,10 +50,14 @@
     "zod": "^3.24.0"
   },
   "peerDependencies": {
+    "@langchain/core": ">=0.2.0",
     "zod": "^3.0.0"
   },
   "peerDependenciesMeta": {
     "zod": {
+      "optional": true
+    },
+    "@langchain/core": {
       "optional": true
     }
   },
@@ -61,7 +70,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/nichochar/lightrace-js.git"
+    "url": "https://github.com/SKE-Labs/lightrace-js.git"
   },
   "keywords": [
     "llm",
@@ -71,7 +80,7 @@
     "opentelemetry",
     "tool-invocation"
   ],
-  "author": "LightRace Contributors",
+  "author": "Lightrace Contributors",
   "engines": {
     "node": ">=20.0.0"
   }
