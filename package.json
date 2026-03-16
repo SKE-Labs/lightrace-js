@@ -1,6 +1,6 @@
 {
   "name": "lightrace",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Lightweight LLM tracing SDK with remote tool invocation",
   "type": "module",
   "main": "./dist/index.js",
