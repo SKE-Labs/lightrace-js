@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { LightraceCallbackHandler } from "../src/integrations/langchain.js";
 import { Lightrace } from "../src/client.js";
 import type { TraceEvent } from "../src/types.js";
@@ -29,7 +29,12 @@ function createTestClient(): { client: Lightrace; events: TraceEvent[] } {
 }
 
 function serializedWithName(name: string): Serialized {
-  return { lc: 1, type: "not_implemented", id: ["langchain", name], name } as unknown as Serialized;
+  return {
+    lc: 1,
+    type: "not_implemented",
+    id: ["langchain", name],
+    name,
+  } as unknown as Serialized;
 }
 
 function serializedLLM(model: string): Serialized {
@@ -382,5 +387,401 @@ describe("LightraceCallbackHandler", () => {
     expect(firstTraceId).toBeTruthy();
     expect(secondTraceId).toBeTruthy();
     expect(firstTraceId).not.toBe(secondTraceId);
+  });
+
+  // ── NEW: undefined/null serialized and inputs ─────────────────────
+
+  it("handles undefined serialized and inputs gracefully", async () => {
+    // LangGraph can pass undefined for serialized and inputs
+    await handler.handleChainStart(
+      undefined as unknown as Serialized,
+      undefined as unknown as Record<string, unknown>,
+      "run-undef",
+    );
+
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe("trace-create");
+
+    await handler.handleChainEnd(undefined as unknown as Record<string, unknown>, "run-undef");
+
+    const chainEvent = events.find((e) => e.type === "chain-create");
+    expect(chainEvent).toBeTruthy();
+    expect(chainEvent!.body.name).toBe("Chain"); // fallback name
+    expect(chainEvent!.body.level).toBe("DEFAULT");
+  });
+
+  // ── NEW: name parameter override ──────────────────────────────────
+
+  it("uses the name parameter when provided to handleChainStart", async () => {
+    await handler.handleChainStart(
+      serializedWithName("GenericChain"),
+      { input: "test" },
+      "run-named",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      "MyCustomName",
+    );
+    await handler.handleChainEnd({}, "run-named");
+
+    const chainEvent = events.find((e) => e.type === "chain-create");
+    expect(chainEvent).toBeTruthy();
+    expect(chainEvent!.body.name).toBe("MyCustomName");
+  });
+
+  it("uses the name parameter when provided to handleLLMStart", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm-named";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(
+      serializedLLM("gpt-4"),
+      ["prompt"],
+      llmRunId,
+      chainRunId,
+      undefined,
+      undefined,
+      undefined,
+      "CustomLLMName",
+    );
+    await handler.handleLLMEnd(
+      { generations: [[{ text: "output", generationInfo: {} }]], llmOutput: {} },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    expect(genEvent!.body.name).toBe("CustomLLMName");
+  });
+
+  it("uses the name parameter when provided to handleToolStart", async () => {
+    const chainRunId = "run-chain";
+    const toolRunId = "run-tool-named";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleToolStart(
+      serializedWithName("generic-tool"),
+      "input",
+      toolRunId,
+      chainRunId,
+      undefined,
+      undefined,
+      "CustomToolName",
+    );
+    await handler.handleToolEnd("result", toolRunId);
+    await handler.handleChainEnd({}, chainRunId);
+
+    const toolEvent = events.find((e) => e.type === "tool-create");
+    expect(toolEvent).toBeTruthy();
+    expect(toolEvent!.body.name).toBe("CustomToolName");
+  });
+
+  // ── NEW: Multi-provider usage (Anthropic-style) ───────────────────
+
+  it("extracts Anthropic-style token usage (input_tokens/output_tokens)", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(serializedLLM("claude-3-opus"), ["prompt"], llmRunId, chainRunId);
+    await handler.handleLLMEnd(
+      {
+        generations: [[{ text: "response", generationInfo: {} }]],
+        llmOutput: {
+          usage: {
+            input_tokens: 100,
+            output_tokens: 50,
+          },
+        },
+      },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    expect(genEvent!.body.promptTokens).toBe(100);
+    expect(genEvent!.body.completionTokens).toBe(50);
+    expect(genEvent!.body.totalTokens).toBe(150); // auto-calculated
+  });
+
+  it("extracts usage_metadata from generation-level message", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(serializedLLM("claude-3"), ["prompt"], llmRunId, chainRunId);
+    await handler.handleLLMEnd(
+      {
+        generations: [
+          [
+            {
+              text: "response",
+              generationInfo: {},
+              message: {
+                content: "response",
+                type: "ai",
+                usage_metadata: {
+                  input_tokens: 200,
+                  output_tokens: 80,
+                },
+              },
+            },
+          ],
+        ],
+        llmOutput: {}, // no usage at llmOutput level
+      },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    expect(genEvent!.body.promptTokens).toBe(200);
+    expect(genEvent!.body.completionTokens).toBe(80);
+  });
+
+  // ── NEW: Model parameter extraction ───────────────────────────────
+
+  it("extracts model parameters from invocation_params", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(serializedLLM("gpt-4"), ["prompt"], llmRunId, chainRunId, {
+      invocation_params: {
+        temperature: 0.7,
+        max_tokens: 1000,
+        top_p: 0.9,
+        frequency_penalty: 0.5,
+        presence_penalty: 0.3,
+        some_other_param: "ignored",
+      },
+    });
+    await handler.handleLLMEnd(
+      { generations: [[{ text: "output", generationInfo: {} }]], llmOutput: {} },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    const params = genEvent!.body.modelParameters as Record<string, unknown>;
+    expect(params).toBeTruthy();
+    expect(params.temperature).toBe(0.7);
+    expect(params.max_tokens).toBe(1000);
+    expect(params.top_p).toBe(0.9);
+    expect(params.frequency_penalty).toBe(0.5);
+    expect(params.presence_penalty).toBe(0.3);
+    expect(params).not.toHaveProperty("some_other_param");
+  });
+
+  it("extracts model parameters in handleChatModelStart", async () => {
+    const chainRunId = "run-chain";
+    const chatRunId = "run-chat";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleChatModelStart(
+      serializedLLM("gpt-4"),
+      [[new HumanMessage("Hello")]],
+      chatRunId,
+      chainRunId,
+      {
+        invocation_params: {
+          temperature: 0.0,
+          max_tokens: 500,
+        },
+      },
+    );
+    await handler.handleLLMEnd(
+      { generations: [[{ text: "Hi", generationInfo: {} }]], llmOutput: {} },
+      chatRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    const params = genEvent!.body.modelParameters as Record<string, unknown>;
+    expect(params).toBeTruthy();
+    expect(params.temperature).toBe(0.0);
+    expect(params.max_tokens).toBe(500);
+  });
+
+  // ── NEW: ChatGeneration with message ──────────────────────────────
+
+  it("extracts ChatGeneration message with role, content, and tool_calls", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(serializedLLM("gpt-4"), ["prompt"], llmRunId, chainRunId);
+    await handler.handleLLMEnd(
+      {
+        generations: [
+          [
+            {
+              text: "",
+              generationInfo: {},
+              message: {
+                content: "Let me search for that.",
+                _getType: () => "ai",
+                tool_calls: [
+                  {
+                    name: "search",
+                    args: { query: "test" },
+                    id: "call-1",
+                  },
+                ],
+              },
+            },
+          ],
+        ],
+        llmOutput: {},
+      },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    const output = genEvent!.body.output as Record<string, unknown>;
+    expect(output.role).toBe("ai");
+    expect(output.content).toBe("Let me search for that.");
+    expect(output.tool_calls).toEqual([{ name: "search", args: { query: "test" }, id: "call-1" }]);
+  });
+
+  it("extracts ChatGeneration message with type fallback (no _getType)", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(serializedLLM("gpt-4"), ["prompt"], llmRunId, chainRunId);
+    await handler.handleLLMEnd(
+      {
+        generations: [
+          [
+            {
+              text: "Hello",
+              generationInfo: {},
+              message: {
+                content: "Hello",
+                type: "ai",
+                // no _getType function
+              },
+            },
+          ],
+        ],
+        llmOutput: {},
+      },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    const output = genEvent!.body.output as Record<string, unknown>;
+    expect(output.role).toBe("ai");
+    expect(output.content).toBe("Hello");
+    expect(output).not.toHaveProperty("tool_calls");
+  });
+
+  // ── NEW: Model name from response ─────────────────────────────────
+
+  it("picks up model name from llmOutput when not set at start", async () => {
+    const chainRunId = "run-chain";
+    const llmRunId = "run-llm";
+
+    // Use a serialized that has no model info
+    const noModelSerialized = {
+      lc: 1,
+      type: "not_implemented",
+      id: ["langchain", "chat_models", "ChatOpenAI"],
+    } as unknown as Serialized;
+
+    await handler.handleChainStart(serializedWithName("Chain"), {}, chainRunId);
+    await handler.handleLLMStart(noModelSerialized, ["prompt"], llmRunId, chainRunId);
+    await handler.handleLLMEnd(
+      {
+        generations: [[{ text: "output", generationInfo: {} }]],
+        llmOutput: { model_name: "gpt-4-turbo" },
+      },
+      llmRunId,
+    );
+    await handler.handleChainEnd({}, chainRunId);
+
+    const genEvent = events.find((e) => e.type === "generation-create");
+    expect(genEvent).toBeTruthy();
+    expect(genEvent!.body.model).toBe("gpt-4-turbo");
+    expect(genEvent!.body.name).toBe("ChatOpenAI"); // name stays from serialized, model updated from response
+  });
+
+  // ── NEW: Error resilience ─────────────────────────────────────────
+
+  it("does not throw when callback receives completely bad input", async () => {
+    // None of these should throw — they should just warn and continue
+    await expect(
+      handler.handleChainStart(
+        null as unknown as Serialized,
+        null as unknown as Record<string, unknown>,
+        "run-bad-1",
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      handler.handleLLMStart(
+        null as unknown as Serialized,
+        null as unknown as string[],
+        "run-bad-2",
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      handler.handleChatModelStart(
+        null as unknown as Serialized,
+        null as unknown as BaseMessage[][],
+        "run-bad-3",
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      handler.handleToolStart(
+        null as unknown as Serialized,
+        null as unknown as string,
+        "run-bad-4",
+      ),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      handler.handleLLMEnd(null as unknown as LLMResult, "run-bad-5"),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      handler.handleRetrieverStart(
+        null as unknown as Serialized,
+        null as unknown as string,
+        "run-bad-6",
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("continues working after a callback error", async () => {
+    // Suppress console.warn during this test
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Trigger an error with bad input
+    await handler.handleLLMEnd(null as unknown as LLMResult, "nonexistent-run");
+
+    // Handler should still work for normal operations
+    await handler.handleChainStart(serializedWithName("Chain"), { ok: true }, "run-after-error");
+    await handler.handleChainEnd({ result: "fine" }, "run-after-error");
+
+    expect(handler.lastTraceId).toBeTruthy();
+    const chainEvent = events.find((e) => e.type === "chain-create");
+    expect(chainEvent).toBeTruthy();
+    expect(chainEvent!.body.name).toBe("Chain");
+
+    warnSpy.mockRestore();
   });
 });

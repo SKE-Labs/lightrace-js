@@ -33,6 +33,7 @@ interface RunInfo {
   parentRunId?: string;
   model?: string;
   metadata?: Record<string, unknown>;
+  modelParameters?: Record<string, unknown>;
 }
 
 export interface LightraceCallbackHandlerOptions {
@@ -91,6 +92,35 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     this.exporter?.enqueue(event);
   }
 
+  /**
+   * Normalize IO data by converting BaseMessage-like objects to plain
+   * {role, content, tool_calls?} objects. Recurses into arrays and plain objects.
+   */
+  private normalizeIO(data: unknown): unknown {
+    if (data === null || data === undefined) return data;
+    if (Array.isArray(data)) return data.map((d) => this.normalizeIO(d));
+    if (typeof data === "object") {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const obj = data as Record<string, any>;
+      // Detect BaseMessage-like objects
+      if ("content" in obj && ("type" in obj || "_getType" in obj)) {
+        const role = typeof obj._getType === "function" ? obj._getType() : (obj.type ?? "unknown");
+        return {
+          role,
+          content: obj.content,
+          ...(obj.tool_calls?.length ? { tool_calls: obj.tool_calls } : {}),
+        };
+      }
+      // Recurse into plain objects
+      const result: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        result[k] = this.normalizeIO(v);
+      }
+      return result;
+    }
+    return data;
+  }
+
   private emitObservation(
     run: RunInfo,
     endTime: Date,
@@ -131,6 +161,10 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
       ...extra,
     };
 
+    if (run.modelParameters && Object.keys(run.modelParameters).length > 0) {
+      body.modelParameters = run.modelParameters;
+    }
+
     this.emit({
       id: generateId(),
       type: eventTypeMap[run.type] ?? "span-create",
@@ -139,7 +173,8 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     });
   }
 
-  private extractModelName(serialized: Serialized): string | undefined {
+  private extractModelName(serialized: Serialized | undefined | null): string | undefined {
+    if (!serialized) return undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const s = serialized as any;
     return (
@@ -147,7 +182,28 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     );
   }
 
-  private isAgent(serialized: Serialized): boolean {
+  private extractModelParameters(
+    extraParams: Record<string, unknown> | undefined,
+  ): Record<string, unknown> {
+    const invocationParams = extraParams?.["invocation_params"] as
+      | Record<string, unknown>
+      | undefined;
+    const modelParameters: Record<string, unknown> = {};
+    for (const key of [
+      "temperature",
+      "max_tokens",
+      "top_p",
+      "frequency_penalty",
+      "presence_penalty",
+    ]) {
+      const val = invocationParams?.[key];
+      if (val !== undefined && val !== null) modelParameters[key] = val;
+    }
+    return modelParameters;
+  }
+
+  private isAgent(serialized: Serialized | undefined | null): boolean {
+    if (!serialized) return false;
     const name = (serialized.id?.join("/") ?? "").toLowerCase();
     const sName = (
       ((serialized as unknown as Record<string, unknown>).name as string) ?? ""
@@ -244,21 +300,28 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     parentRunId?: string,
     tags?: string[],
     metadata?: Record<string, unknown>,
+    _runType?: string,
+    name?: string,
   ): Promise<void> {
-    const name =
-      ((chain as unknown as Record<string, unknown>).name as string) ??
-      chain.id?.[chain.id.length - 1] ??
-      "Chain";
-    const type = this.isAgent(chain) ? "chain" : "chain";
-    const mergedMetadata = { ...metadata, ...(tags?.length ? { tags } : {}) };
+    try {
+      const resolvedName =
+        name ??
+        ((chain as unknown as Record<string, unknown>)?.name as string) ??
+        chain?.id?.[chain.id.length - 1] ??
+        "Chain";
+      const type = this.isAgent(chain) ? "chain" : "chain";
+      const mergedMetadata = { ...metadata, ...(tags?.length ? { tags } : {}) };
 
-    this.registerRun(runId, parentRunId, {
-      type,
-      name,
-      startTime: new Date(),
-      input: inputs,
-      metadata: Object.keys(mergedMetadata).length > 0 ? mergedMetadata : undefined,
-    });
+      this.registerRun(runId, parentRunId, {
+        type,
+        name: resolvedName,
+        startTime: new Date(),
+        input: this.normalizeIO(inputs ?? {}),
+        metadata: Object.keys(mergedMetadata).length > 0 ? mergedMetadata : undefined,
+      });
+    } catch (e) {
+      console.warn("[lightrace] Error in handleChainStart:", e);
+    }
   }
 
   async handleChainEnd(
@@ -266,16 +329,24 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     runId: string,
     _parentRunId?: string,
   ): Promise<void> {
-    this.endRun(runId, outputs);
+    try {
+      this.endRun(runId, this.normalizeIO(outputs ?? null));
+    } catch (e) {
+      console.warn("[lightrace] Error in handleChainEnd:", e);
+    }
   }
 
   async handleChainError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
-    // LangGraph GraphBubbleUp is a control flow error, not an actual error
-    if (error?.constructor?.name === "GraphBubbleUp" || error?.name === "GraphBubbleUp") {
-      this.endRun(runId, null, "DEFAULT", null);
-      return;
+    try {
+      // LangGraph GraphBubbleUp is a control flow error, not an actual error
+      if (error?.constructor?.name === "GraphBubbleUp" || error?.name === "GraphBubbleUp") {
+        this.endRun(runId, null, "DEFAULT", null);
+        return;
+      }
+      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+    } catch (e) {
+      console.warn("[lightrace] Error in handleChainError:", e);
     }
-    this.endRun(runId, null, "ERROR", error.message ?? String(error));
   }
 
   // ── LLM callbacks ───────────────────────────────────────────────────
@@ -285,25 +356,33 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     prompts: string[],
     runId: string,
     parentRunId?: string,
-    _extraParams?: Record<string, unknown>,
+    extraParams?: Record<string, unknown>,
     _tags?: string[],
     metadata?: Record<string, unknown>,
+    name?: string,
   ): Promise<void> {
-    const model = this.extractModelName(llm);
-    const name =
-      model ??
-      ((llm as unknown as Record<string, unknown>).name as string) ??
-      llm.id?.[llm.id.length - 1] ??
-      "LLM";
+    try {
+      const model = this.extractModelName(llm);
+      const resolvedName =
+        name ??
+        model ??
+        ((llm as unknown as Record<string, unknown>)?.name as string) ??
+        llm?.id?.[llm.id.length - 1] ??
+        "LLM";
+      const modelParameters = this.extractModelParameters(extraParams);
 
-    this.registerRun(runId, parentRunId, {
-      type: "generation",
-      name,
-      startTime: new Date(),
-      input: prompts.length === 1 ? prompts[0] : prompts,
-      model,
-      metadata,
-    });
+      this.registerRun(runId, parentRunId, {
+        type: "generation",
+        name: resolvedName,
+        startTime: new Date(),
+        input: prompts?.length === 1 ? prompts[0] : (prompts ?? []),
+        model,
+        metadata,
+        modelParameters,
+      });
+    } catch (e) {
+      console.warn("[lightrace] Error in handleLLMStart:", e);
+    }
   }
 
   async handleChatModelStart(
@@ -311,86 +390,170 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     messages: BaseMessage[][],
     runId: string,
     parentRunId?: string,
-    _extraParams?: Record<string, unknown>,
+    extraParams?: Record<string, unknown>,
     _tags?: string[],
     metadata?: Record<string, unknown>,
+    name?: string,
   ): Promise<void> {
-    const model = this.extractModelName(llm);
-    const name =
-      model ??
-      ((llm as unknown as Record<string, unknown>).name as string) ??
-      llm.id?.[llm.id.length - 1] ??
-      "ChatModel";
+    try {
+      const model = this.extractModelName(llm);
+      const resolvedName =
+        name ??
+        model ??
+        ((llm as unknown as Record<string, unknown>)?.name as string) ??
+        llm?.id?.[llm.id.length - 1] ??
+        "ChatModel";
+      const modelParameters = this.extractModelParameters(extraParams);
 
-    // Convert messages to a simpler role/content format
-    const formattedMessages = messages.map((msgGroup) =>
-      msgGroup.map((msg) => ({
-        role: msg._getType(),
-        content: msg.content,
-        ...(msg.name ? { name: msg.name } : {}),
-      })),
-    );
+      // Convert messages to a simpler role/content format
+      const formattedMessages = (messages ?? []).map((msgGroup) =>
+        (msgGroup ?? []).map((msg) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const msgAny = msg as any;
+          const role =
+            typeof msgAny?._getType === "function"
+              ? msgAny._getType()
+              : (msgAny?.type ?? "unknown");
+          return {
+            role,
+            content: msg?.content,
+            ...(msg?.name ? { name: msg.name } : {}),
+            ...(msgAny?.tool_calls?.length ? { tool_calls: msgAny.tool_calls } : {}),
+          };
+        }),
+      );
 
-    this.registerRun(runId, parentRunId, {
-      type: "generation",
-      name,
-      startTime: new Date(),
-      input: formattedMessages.length === 1 ? formattedMessages[0] : formattedMessages,
-      model,
-      metadata,
-    });
+      this.registerRun(runId, parentRunId, {
+        type: "generation",
+        name: resolvedName,
+        startTime: new Date(),
+        input: formattedMessages.length === 1 ? formattedMessages[0] : formattedMessages,
+        model,
+        metadata,
+        modelParameters,
+      });
+    } catch (e) {
+      console.warn("[lightrace] Error in handleChatModelStart:", e);
+    }
   }
 
   async handleLLMEnd(output: LLMResult, runId: string, _parentRunId?: string): Promise<void> {
-    const extra: Record<string, unknown> = {};
+    try {
+      const extra: Record<string, unknown> = {};
+      const run = this.runs.get(runId);
 
-    // Extract token usage
-    const usage = output.llmOutput?.tokenUsage ?? output.llmOutput?.estimatedTokens ?? null;
-    if (usage) {
-      if (usage.promptTokens !== undefined) extra.promptTokens = usage.promptTokens;
-      if (usage.completionTokens !== undefined) extra.completionTokens = usage.completionTokens;
-      if (usage.totalTokens !== undefined) extra.totalTokens = usage.totalTokens;
+      // Extract token usage from multiple sources
+      const llmUsage = output?.llmOutput?.tokenUsage ?? output?.llmOutput?.usage ?? null;
+
+      // Also check generation-level usage_metadata (e.g. Anthropic, Google)
+      const lastGen = output?.generations?.at(-1)?.at(-1);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const msgUsage = (lastGen as any)?.message?.usage_metadata;
+      const usage = llmUsage ?? msgUsage;
+
+      if (usage) {
+        const promptTokens =
+          usage.promptTokens ?? usage.prompt_tokens ?? usage.input_tokens ?? undefined;
+        const completionTokens =
+          usage.completionTokens ?? usage.completion_tokens ?? usage.output_tokens ?? undefined;
+        const totalTokens = usage.totalTokens ?? usage.total_tokens ?? undefined;
+
+        if (promptTokens !== undefined) extra.promptTokens = promptTokens;
+        if (completionTokens !== undefined) extra.completionTokens = completionTokens;
+        if (totalTokens !== undefined) extra.totalTokens = totalTokens;
+        else if (promptTokens !== undefined && completionTokens !== undefined)
+          extra.totalTokens = promptTokens + completionTokens;
+      }
+
+      // Extract model name from response if not set at start
+      if (run && !run.model) {
+        const modelFromResponse =
+          output?.llmOutput?.model_name ?? output?.llmOutput?.model ?? undefined;
+        if (modelFromResponse) {
+          run.model = modelFromResponse as string;
+          // Also update name if it was a default
+          if (run.name === "LLM" || run.name === "ChatModel") {
+            run.name = modelFromResponse as string;
+          }
+        }
+      }
+
+      // Add TTFT if we have it
+      const ttftStart = this.completionStartTimes.get(runId);
+      if (ttftStart && run) {
+        const ttft = ttftStart.getTime() - run.startTime.getTime();
+        if (!run.metadata) run.metadata = {};
+        run.metadata.timeToFirstToken = ttft;
+      }
+
+      // Extract output — handle ChatGeneration (has .message) vs Generation (only .text)
+      let outputData: unknown;
+      const generations = output?.generations;
+      if (generations && generations.length > 0) {
+        const singleGen = generations.length === 1 && generations[0].length === 1;
+        if (singleGen) {
+          const gen = generations[0][0];
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const genAny = gen as any;
+          if (genAny?.message) {
+            const msg = genAny.message;
+            const role =
+              typeof msg._getType === "function" ? msg._getType() : (msg.type ?? "assistant");
+            outputData = {
+              role,
+              content: msg.content,
+              ...(msg.tool_calls?.length ? { tool_calls: msg.tool_calls } : {}),
+            };
+          } else {
+            outputData = gen?.text;
+          }
+        } else {
+          outputData = generations.map((g) =>
+            g.map((gg) => {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const ggAny = gg as any;
+              if (ggAny?.message) {
+                const msg = ggAny.message;
+                const role =
+                  typeof msg._getType === "function" ? msg._getType() : (msg.type ?? "assistant");
+                return {
+                  role,
+                  content: msg.content,
+                  ...(msg.tool_calls?.length ? { tool_calls: msg.tool_calls } : {}),
+                };
+              }
+              return gg?.text;
+            }),
+          );
+        }
+      } else {
+        outputData = null;
+      }
+
+      this.endRun(runId, outputData, "DEFAULT", null, extra);
+      this.completionStartTimes.delete(runId);
+    } catch (e) {
+      console.warn("[lightrace] Error in handleLLMEnd:", e);
     }
-
-    // Add TTFT if we have it
-    const ttftStart = this.completionStartTimes.get(runId);
-    const run = this.runs.get(runId);
-    if (ttftStart && run) {
-      const ttft = ttftStart.getTime() - run.startTime.getTime();
-      if (!run.metadata) run.metadata = {};
-      run.metadata.timeToFirstToken = ttft;
-    }
-
-    // Extract output text
-    const generations = output.generations;
-    let outputText: unknown;
-    if (generations.length === 1 && generations[0].length === 1) {
-      const gen = generations[0][0];
-      // ChatGeneration has a `message` field, base Generation only has `text`
-      const genAny = gen as unknown as Record<string, unknown>;
-      outputText = genAny.message ?? gen.text;
-    } else {
-      outputText = generations.map((g) =>
-        g.map((gg) => {
-          const ggAny = gg as unknown as Record<string, unknown>;
-          return ggAny.message ?? gg.text;
-        }),
-      );
-    }
-
-    this.endRun(runId, outputText, "DEFAULT", null, extra);
-    this.completionStartTimes.delete(runId);
   }
 
   async handleLLMNewToken(_token: string, _idx: unknown, runId: string): Promise<void> {
-    if (!this.completionStartTimes.has(runId)) {
-      this.completionStartTimes.set(runId, new Date());
+    try {
+      if (!this.completionStartTimes.has(runId)) {
+        this.completionStartTimes.set(runId, new Date());
+      }
+    } catch (e) {
+      console.warn("[lightrace] Error in handleLLMNewToken:", e);
     }
   }
 
   async handleLLMError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
-    this.endRun(runId, null, "ERROR", error.message ?? String(error));
-    this.completionStartTimes.delete(runId);
+    try {
+      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+      this.completionStartTimes.delete(runId);
+    } catch (e) {
+      console.warn("[lightrace] Error in handleLLMError:", e);
+    }
   }
 
   // ── Tool callbacks ──────────────────────────────────────────────────
@@ -402,42 +565,60 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     parentRunId?: string,
     _tags?: string[],
     metadata?: Record<string, unknown>,
+    name?: string,
   ): Promise<void> {
-    const name =
-      ((tool as unknown as Record<string, unknown>).name as string) ??
-      tool.id?.[tool.id.length - 1] ??
-      "Tool";
-
-    // Try to parse input as JSON
-    let parsedInput: unknown = input;
     try {
-      parsedInput = JSON.parse(input);
-    } catch {
-      // keep as string
-    }
+      const resolvedName =
+        name ??
+        ((tool as unknown as Record<string, unknown>)?.name as string) ??
+        tool?.id?.[tool.id.length - 1] ??
+        "Tool";
 
-    this.registerRun(runId, parentRunId, {
-      type: "tool",
-      name,
-      startTime: new Date(),
-      input: parsedInput,
-      metadata,
-    });
+      // Try to parse input as JSON
+      let parsedInput: unknown = input;
+      if (typeof input === "string") {
+        try {
+          parsedInput = JSON.parse(input);
+        } catch {
+          // keep as string
+        }
+      }
+
+      this.registerRun(runId, parentRunId, {
+        type: "tool",
+        name: resolvedName,
+        startTime: new Date(),
+        input: parsedInput,
+        metadata,
+      });
+    } catch (e) {
+      console.warn("[lightrace] Error in handleToolStart:", e);
+    }
   }
 
   async handleToolEnd(output: string, runId: string, _parentRunId?: string): Promise<void> {
-    // Try to parse output as JSON
-    let parsedOutput: unknown = output;
     try {
-      parsedOutput = JSON.parse(output);
-    } catch {
-      // keep as string
+      // Try to parse output as JSON
+      let parsedOutput: unknown = output;
+      if (typeof output === "string") {
+        try {
+          parsedOutput = JSON.parse(output);
+        } catch {
+          // keep as string
+        }
+      }
+      this.endRun(runId, parsedOutput);
+    } catch (e) {
+      console.warn("[lightrace] Error in handleToolEnd:", e);
     }
-    this.endRun(runId, parsedOutput);
   }
 
   async handleToolError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
-    this.endRun(runId, null, "ERROR", error.message ?? String(error));
+    try {
+      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+    } catch (e) {
+      console.warn("[lightrace] Error in handleToolError:", e);
+    }
   }
 
   // ── Retriever callbacks ─────────────────────────────────────────────
@@ -450,18 +631,22 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     _tags?: string[],
     metadata?: Record<string, unknown>,
   ): Promise<void> {
-    const name =
-      ((retriever as unknown as Record<string, unknown>).name as string) ??
-      retriever.id?.[retriever.id.length - 1] ??
-      "Retriever";
+    try {
+      const name =
+        ((retriever as unknown as Record<string, unknown>)?.name as string) ??
+        retriever?.id?.[retriever.id.length - 1] ??
+        "Retriever";
 
-    this.registerRun(runId, parentRunId, {
-      type: "span",
-      name,
-      startTime: new Date(),
-      input: query,
-      metadata,
-    });
+      this.registerRun(runId, parentRunId, {
+        type: "span",
+        name,
+        startTime: new Date(),
+        input: query,
+        metadata,
+      });
+    } catch (e) {
+      console.warn("[lightrace] Error in handleRetrieverStart:", e);
+    }
   }
 
   async handleRetrieverEnd(
@@ -469,15 +654,23 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     runId: string,
     _parentRunId?: string,
   ): Promise<void> {
-    const output = documents.map((doc) => ({
-      pageContent: doc.pageContent,
-      metadata: doc.metadata,
-    }));
-    this.endRun(runId, output);
+    try {
+      const output = (documents ?? []).map((doc) => ({
+        pageContent: doc?.pageContent,
+        metadata: doc?.metadata,
+      }));
+      this.endRun(runId, output);
+    } catch (e) {
+      console.warn("[lightrace] Error in handleRetrieverEnd:", e);
+    }
   }
 
   async handleRetrieverError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
-    this.endRun(runId, null, "ERROR", error.message ?? String(error));
+    try {
+      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+    } catch (e) {
+      console.warn("[lightrace] Error in handleRetrieverError:", e);
+    }
   }
 
   // ── Accessors ───────────────────────────────────────────────────────
