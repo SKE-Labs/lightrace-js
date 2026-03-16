@@ -1,23 +1,29 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Observation } from "../src/observation.js";
-import type { TraceEvent } from "../src/types.js";
+import {
+  BasicTracerProvider,
+  SimpleSpanProcessor,
+  InMemorySpanExporter,
+} from "@opentelemetry/sdk-trace-base";
+import type { LightraceOtelExporter } from "../src/otel-exporter.js";
+import * as attrs from "../src/otel-exporter.js";
 
-// Mock exporter that captures events
-class MockExporter {
-  events: TraceEvent[] = [];
-  enqueue(event: TraceEvent) {
-    this.events.push(event);
-  }
-}
-
-let mock: MockExporter;
+let memoryExporter: InMemorySpanExporter;
+let provider: BasicTracerProvider;
+let otelExporter: LightraceOtelExporter;
 
 beforeEach(() => {
-  mock = new MockExporter();
+  memoryExporter = new InMemorySpanExporter();
+  provider = new BasicTracerProvider({
+    spanProcessors: [new SimpleSpanProcessor(memoryExporter)],
+  });
+  const tracer = provider.getTracer("test");
+  otelExporter = { tracer } as any;
 });
 
 afterEach(() => {
-  mock.events = [];
+  memoryExporter.reset();
+  provider.shutdown();
 });
 
 describe("Observation - span", () => {
@@ -26,24 +32,27 @@ describe("Observation - span", () => {
       traceId: "trace-1",
       type: "span",
       name: "search",
-      exporter: mock as any,
+      otelExporter,
       input: { query: "hello" },
     });
 
     obs.update({ output: { results: ["a", "b"] } });
     obs.end();
 
-    expect(mock.events).toHaveLength(1);
-    const event = mock.events[0];
-    expect(event.type).toBe("span-create");
-    expect(event.body.name).toBe("search");
-    expect(event.body.traceId).toBe("trace-1");
-    expect(event.body.type).toBe("SPAN");
-    expect(event.body.input).toEqual({ query: "hello" });
-    expect(event.body.output).toEqual({ results: ["a", "b"] });
-    expect(event.body.startTime).toBeDefined();
-    expect(event.body.endTime).toBeDefined();
-    expect(event.body.level).toBe("DEFAULT");
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].name).toBe("search");
+    expect(spans[0].attributes[attrs.OBSERVATION_TYPE]).toBe("SPAN");
+
+    const input = JSON.parse(spans[0].attributes[attrs.OBSERVATION_INPUT] as string);
+    expect(input).toEqual({ query: "hello" });
+
+    const output = JSON.parse(spans[0].attributes[attrs.OBSERVATION_OUTPUT] as string);
+    expect(output).toEqual({ results: ["a", "b"] });
+
+    expect(spans[0].attributes[attrs.OBSERVATION_LEVEL]).toBe("DEFAULT");
+    expect(spans[0].startTime).toBeDefined();
+    expect(spans[0].endTime).toBeDefined();
   });
 
   it("end() is idempotent", () => {
@@ -51,13 +60,14 @@ describe("Observation - span", () => {
       traceId: "trace-1",
       type: "span",
       name: "test",
-      exporter: mock as any,
+      otelExporter,
     });
 
     obs.end();
     obs.end();
 
-    expect(mock.events).toHaveLength(1);
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
   });
 });
 
@@ -67,7 +77,7 @@ describe("Observation - generation with usage", () => {
       traceId: "trace-2",
       type: "generation",
       name: "llm-call",
-      exporter: mock as any,
+      otelExporter,
       input: "prompt text",
       model: "gpt-4o",
     });
@@ -78,15 +88,17 @@ describe("Observation - generation with usage", () => {
     });
     obs.end();
 
-    expect(mock.events).toHaveLength(1);
-    const event = mock.events[0];
-    expect(event.type).toBe("generation-create");
-    expect(event.body.model).toBe("gpt-4o");
-    expect(event.body.input).toBe("prompt text");
-    expect(event.body.output).toBe("response text");
-    expect(event.body.promptTokens).toBe(10);
-    expect(event.body.completionTokens).toBe(50);
-    expect(event.body.totalTokens).toBe(60);
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].attributes[attrs.OBSERVATION_TYPE]).toBe("GENERATION");
+    expect(spans[0].attributes[attrs.OBSERVATION_MODEL]).toBe("gpt-4o");
+    expect(spans[0].attributes[attrs.OBSERVATION_INPUT]).toBe("prompt text");
+    expect(spans[0].attributes[attrs.OBSERVATION_OUTPUT]).toBe("response text");
+
+    const usage = JSON.parse(spans[0].attributes[attrs.OBSERVATION_USAGE_DETAILS] as string);
+    expect(usage.promptTokens).toBe(10);
+    expect(usage.completionTokens).toBe(50);
+    expect(usage.totalTokens).toBe(60);
   });
 
   it("allows partial usage", () => {
@@ -94,34 +106,36 @@ describe("Observation - generation with usage", () => {
       traceId: "trace-2",
       type: "generation",
       name: "gen",
-      exporter: mock as any,
+      otelExporter,
       usage: { totalTokens: 100 },
     });
     obs.end();
 
-    expect(mock.events[0].body.totalTokens).toBe(100);
-    expect(mock.events[0].body.promptTokens).toBeUndefined();
+    const spans = memoryExporter.getFinishedSpans();
+    const usage = JSON.parse(spans[0].attributes[attrs.OBSERVATION_USAGE_DETAILS] as string);
+    expect(usage.totalTokens).toBe(100);
+    expect(usage.promptTokens).toBeUndefined();
   });
 });
 
 describe("Observation - event (auto-ended)", () => {
   it("is emitted immediately when auto-ended", () => {
-    // Simulating what Lightrace.event() does
     const obs = new Observation({
       traceId: "trace-3",
       type: "event",
       name: "user-click",
-      exporter: mock as any,
+      otelExporter,
       input: { button: "submit" },
     });
     obs.end();
 
-    expect(mock.events).toHaveLength(1);
-    const event = mock.events[0];
-    expect(event.type).toBe("event-create");
-    expect(event.body.type).toBe("EVENT");
-    expect(event.body.name).toBe("user-click");
-    expect(event.body.input).toEqual({ button: "submit" });
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+    expect(spans[0].attributes[attrs.OBSERVATION_TYPE]).toBe("EVENT");
+    expect(spans[0].name).toBe("user-click");
+
+    const input = JSON.parse(spans[0].attributes[attrs.OBSERVATION_INPUT] as string);
+    expect(input).toEqual({ button: "submit" });
   });
 });
 
@@ -131,7 +145,7 @@ describe("Observation - nested spans", () => {
       traceId: "trace-4",
       type: "span",
       name: "parent-span",
-      exporter: mock as any,
+      otelExporter,
       input: "parent-input",
     });
 
@@ -145,23 +159,20 @@ describe("Observation - nested spans", () => {
     parent.update({ output: "parent-output" });
     parent.end();
 
-    expect(mock.events).toHaveLength(2);
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(2);
 
-    const childEvent = mock.events[0];
-    const parentEvent = mock.events[1];
+    const childSpan = spans[0];
+    const parentSpan = spans[1];
 
-    // Child should share the same traceId
-    expect(childEvent.body.traceId).toBe("trace-4");
-    expect(parentEvent.body.traceId).toBe("trace-4");
+    // Both should be span type
+    expect(childSpan.attributes[attrs.OBSERVATION_TYPE]).toBe("SPAN");
+    expect(parentSpan.attributes[attrs.OBSERVATION_TYPE]).toBe("SPAN");
 
-    // Child should have parent's id as parentObservationId
-    expect(childEvent.body.parentObservationId).toBe(parent.id);
-    expect(parentEvent.body.parentObservationId).toBeNull();
-
-    expect(childEvent.body.name).toBe("child-span");
-    expect(childEvent.body.output).toBe("child-output");
-    expect(parentEvent.body.name).toBe("parent-span");
-    expect(parentEvent.body.output).toBe("parent-output");
+    expect(childSpan.name).toBe("child-span");
+    expect(childSpan.attributes[attrs.OBSERVATION_OUTPUT]).toBe("child-output");
+    expect(parentSpan.name).toBe("parent-span");
+    expect(parentSpan.attributes[attrs.OBSERVATION_OUTPUT]).toBe("parent-output");
   });
 
   it("supports multiple levels of nesting", () => {
@@ -169,7 +180,7 @@ describe("Observation - nested spans", () => {
       traceId: "trace-5",
       type: "span",
       name: "root",
-      exporter: mock as any,
+      otelExporter,
     });
 
     const mid = root.span({ name: "mid" });
@@ -179,15 +190,16 @@ describe("Observation - nested spans", () => {
     mid.end();
     root.end();
 
-    expect(mock.events).toHaveLength(3);
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(3);
 
-    const leafEvent = mock.events[0];
-    const midEvent = mock.events[1];
-    const rootEvent = mock.events[2];
+    const leafSpan = spans[0];
+    const midSpan = spans[1];
+    const rootSpan = spans[2];
 
-    expect(leafEvent.body.parentObservationId).toBe(mid.id);
-    expect(midEvent.body.parentObservationId).toBe(root.id);
-    expect(rootEvent.body.parentObservationId).toBeNull();
+    expect(leafSpan.name).toBe("leaf");
+    expect(midSpan.name).toBe("mid");
+    expect(rootSpan.name).toBe("root");
   });
 });
 
@@ -197,14 +209,16 @@ describe("Observation - update fields", () => {
       traceId: "trace-6",
       type: "span",
       name: "meta-test",
-      exporter: mock as any,
+      otelExporter,
       metadata: { key1: "val1" },
     });
 
     obs.update({ metadata: { key2: "val2" } });
     obs.end();
 
-    expect(mock.events[0].body.metadata).toEqual({ key1: "val1", key2: "val2" });
+    const spans = memoryExporter.getFinishedSpans();
+    const metadata = JSON.parse(spans[0].attributes[attrs.OBSERVATION_METADATA] as string);
+    expect(metadata).toEqual({ key1: "val1", key2: "val2" });
   });
 
   it("supports level and statusMessage", () => {
@@ -212,13 +226,14 @@ describe("Observation - update fields", () => {
       traceId: "trace-7",
       type: "span",
       name: "error-span",
-      exporter: mock as any,
+      otelExporter,
     });
 
     obs.update({ level: "ERROR", statusMessage: "something went wrong" });
     obs.end();
 
-    expect(mock.events[0].body.level).toBe("ERROR");
-    expect(mock.events[0].body.statusMessage).toBe("something went wrong");
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans[0].attributes[attrs.OBSERVATION_LEVEL]).toBe("ERROR");
+    expect(spans[0].attributes[attrs.OBSERVATION_STATUS_MESSAGE]).toBe("something went wrong");
   });
 });

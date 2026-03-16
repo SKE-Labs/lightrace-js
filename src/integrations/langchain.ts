@@ -3,7 +3,7 @@
  *
  * Extends `BaseCallbackHandler` from `@langchain/core` to automatically
  * capture chains, LLM calls, tool invocations, and retriever operations
- * as Lightrace trace observations.
+ * as Lightrace trace observations via OpenTelemetry spans.
  *
  * @example
  * ```ts
@@ -19,9 +19,10 @@ import type { Serialized } from "@langchain/core/load/serializable";
 import type { LLMResult } from "@langchain/core/outputs";
 import type { BaseMessage } from "@langchain/core/messages";
 import type { DocumentInterface } from "@langchain/core/documents";
-import type { TraceEvent } from "../types.js";
+import type { Span } from "@opentelemetry/api";
 import { generateId, jsonSerializable } from "../utils.js";
-import type { BatchExporter } from "../exporter.js";
+import type { LightraceOtelExporter } from "../otel-exporter.js";
+import * as attrs from "../otel-exporter.js";
 import { Lightrace } from "../client.js";
 
 interface RunInfo {
@@ -34,6 +35,7 @@ interface RunInfo {
   model?: string;
   metadata?: Record<string, unknown>;
   modelParameters?: Record<string, unknown>;
+  span: Span;
 }
 
 export interface LightraceCallbackHandlerOptions {
@@ -65,8 +67,11 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
   private traceName?: string;
   private rootMetadata?: Record<string, unknown>;
 
-  // Exporter
-  private exporter: BatchExporter | null = null;
+  // OTel exporter
+  private otelExporter: LightraceOtelExporter | null = null;
+
+  /** Root span for the current trace. */
+  private rootSpan: Span | null = null;
 
   /** The trace ID from the most recently completed root run. */
   lastTraceId: string | null = null;
@@ -79,17 +84,13 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     this.rootMetadata = opts?.metadata;
 
     const client = opts?.client ?? Lightrace.getInstance();
-    this.exporter = client?.getExporter() ?? null;
+    this.otelExporter = client?.getOtelExporter() ?? null;
   }
 
-  // ── helpers ──────────────────────────────────────────────────────────
+  // -- helpers ----------------------------------------------------------------
 
   private getParentObservationId(observationId: string): string | null {
     return this.runParents.get(observationId) ?? null;
-  }
-
-  private emit(event: TraceEvent): void {
-    this.exporter?.enqueue(event);
   }
 
   /**
@@ -121,21 +122,13 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     return data;
   }
 
-  private emitObservation(
+  private endObservationSpan(
     run: RunInfo,
-    endTime: Date,
     output: unknown,
     level: string,
     statusMessage: string | null,
     extra?: Record<string, unknown>,
   ): void {
-    const eventTypeMap: Record<string, string> = {
-      span: "span-create",
-      generation: "generation-create",
-      event: "event-create",
-      tool: "tool-create",
-      chain: "chain-create",
-    };
     const obsTypeMap: Record<string, string> = {
       span: "SPAN",
       generation: "GENERATION",
@@ -144,33 +137,38 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
       chain: "CHAIN",
     };
 
-    const body: Record<string, unknown> = {
-      id: run.observationId,
-      traceId: this._traceId,
-      type: obsTypeMap[run.type] ?? run.type,
-      name: run.name,
-      startTime: run.startTime.toISOString(),
-      endTime: endTime.toISOString(),
-      input: jsonSerializable(run.input),
-      output: jsonSerializable(output),
-      metadata: run.metadata ?? null,
-      model: run.model ?? null,
-      level,
-      statusMessage,
-      parentObservationId: this.getParentObservationId(run.observationId) ?? null,
-      ...extra,
-    };
+    const span = run.span;
 
+    span.setAttribute(attrs.OBSERVATION_TYPE, obsTypeMap[run.type] ?? run.type);
+    span.setAttribute(attrs.OBSERVATION_INPUT, attrs.safeJson(jsonSerializable(run.input)));
+    span.setAttribute(attrs.OBSERVATION_OUTPUT, attrs.safeJson(jsonSerializable(output)));
+    span.setAttribute(attrs.OBSERVATION_LEVEL, level);
+
+    if (run.metadata) {
+      span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(run.metadata));
+    }
+    if (run.model) {
+      span.setAttribute(attrs.OBSERVATION_MODEL, run.model);
+    }
+    if (statusMessage) {
+      span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, statusMessage);
+    }
     if (run.modelParameters && Object.keys(run.modelParameters).length > 0) {
-      body.modelParameters = run.modelParameters;
+      span.setAttribute(attrs.OBSERVATION_MODEL_PARAMETERS, attrs.safeJson(run.modelParameters));
+    }
+    if (extra) {
+      // Usage details from extra (promptTokens, completionTokens, totalTokens)
+      const usageDetails: Record<string, unknown> = {};
+      if (extra.promptTokens !== undefined) usageDetails.promptTokens = extra.promptTokens;
+      if (extra.completionTokens !== undefined)
+        usageDetails.completionTokens = extra.completionTokens;
+      if (extra.totalTokens !== undefined) usageDetails.totalTokens = extra.totalTokens;
+      if (Object.keys(usageDetails).length > 0) {
+        span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(usageDetails));
+      }
     }
 
-    this.emit({
-      id: generateId(),
-      type: eventTypeMap[run.type] ?? "span-create",
-      timestamp: run.startTime.toISOString(),
-      body,
-    });
+    span.end();
   }
 
   private extractModelName(serialized: Serialized | undefined | null): string | undefined {
@@ -214,32 +212,57 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
   private registerRun(
     runId: string,
     parentRunId: string | undefined,
-    info: Omit<RunInfo, "observationId" | "parentRunId">,
+    info: Omit<RunInfo, "observationId" | "parentRunId" | "span">,
   ): RunInfo {
+    const tracer = this.otelExporter?.tracer;
     const isRoot = !this.rootRunId;
+
     if (isRoot) {
       this.rootRunId = runId;
       this._traceId = generateId();
 
-      // Emit root trace-create event
-      this.emit({
-        id: generateId(),
-        type: "trace-create",
-        timestamp: info.startTime.toISOString(),
-        body: {
-          id: this._traceId,
-          name: this.traceName ?? info.name,
-          timestamp: info.startTime.toISOString(),
-          userId: this.userId,
-          sessionId: this.sessionId,
-          metadata: this.rootMetadata ?? null,
-          input: jsonSerializable(info.input),
-        },
-      });
+      // Create root span representing the trace
+      if (tracer) {
+        this.rootSpan = tracer.startSpan(this.traceName ?? info.name, {
+          startTime: info.startTime,
+        });
+        this.rootSpan.setAttribute(attrs.AS_ROOT, "true");
+        this.rootSpan.setAttribute(attrs.TRACE_NAME, this.traceName ?? info.name);
+        this.rootSpan.setAttribute(attrs.TRACE_INPUT, attrs.safeJson(jsonSerializable(info.input)));
+        if (this.userId) this.rootSpan.setAttribute(attrs.TRACE_USER_ID, this.userId);
+        if (this.sessionId) this.rootSpan.setAttribute(attrs.TRACE_SESSION_ID, this.sessionId);
+        if (this.rootMetadata) {
+          this.rootSpan.setAttribute(attrs.TRACE_METADATA, attrs.safeJson(this.rootMetadata));
+        }
+      }
     }
 
     const observationId = generateId();
-    const runInfo: RunInfo = { ...info, observationId, parentRunId };
+
+    // Create an OTel span for this observation
+    let span: Span;
+    if (tracer) {
+      span = tracer.startSpan(info.name, { startTime: info.startTime });
+    } else {
+      // Dummy span if no tracer -- will be a no-op
+      span = {
+        setAttribute: () => span,
+        setAttributes: () => span,
+        addEvent: () => span,
+        setStatus: () => span,
+        end: () => {},
+        isRecording: () => false,
+        recordException: () => {},
+        spanContext: () => ({
+          traceId: "",
+          spanId: "",
+          traceFlags: 0,
+        }),
+        updateName: () => span,
+      } as unknown as Span;
+    }
+
+    const runInfo: RunInfo = { ...info, observationId, parentRunId, span };
     this.runs.set(runId, runInfo);
     this.runParents.set(
       observationId,
@@ -259,26 +282,15 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     const run = this.runs.get(runId);
     if (!run) return;
 
-    const endTime = new Date();
-    this.emitObservation(run, endTime, output, level, statusMessage, extra);
+    this.endObservationSpan(run, output, level, statusMessage, extra);
 
-    // If this is the root run completing, update the trace and reset
+    // If this is the root run completing, end the root span and reset
     if (runId === this.rootRunId) {
-      // Emit trace-create with output (update)
-      this.emit({
-        id: generateId(),
-        type: "trace-create",
-        timestamp: run.startTime.toISOString(),
-        body: {
-          id: this._traceId,
-          name: this.traceName ?? run.name,
-          timestamp: run.startTime.toISOString(),
-          output: jsonSerializable(output),
-          userId: this.userId,
-          sessionId: this.sessionId,
-          metadata: this.rootMetadata ?? null,
-        },
-      });
+      if (this.rootSpan) {
+        this.rootSpan.setAttribute(attrs.TRACE_OUTPUT, attrs.safeJson(jsonSerializable(output)));
+        this.rootSpan.end();
+        this.rootSpan = null;
+      }
 
       this.lastTraceId = this._traceId;
       this.rootRunId = null;
@@ -291,7 +303,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     }
   }
 
-  // ── Chain callbacks ──────────────────────────────────────────────────
+  // -- Chain callbacks --------------------------------------------------------
 
   async handleChainStart(
     chain: Serialized,
@@ -349,7 +361,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     }
   }
 
-  // ── LLM callbacks ───────────────────────────────────────────────────
+  // -- LLM callbacks ----------------------------------------------------------
 
   async handleLLMStart(
     llm: Serialized,
@@ -486,7 +498,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
         run.metadata.timeToFirstToken = ttft;
       }
 
-      // Extract output — handle ChatGeneration (has .message) vs Generation (only .text)
+      // Extract output -- handle ChatGeneration (has .message) vs Generation (only .text)
       let outputData: unknown;
       const generations = output?.generations;
       if (generations && generations.length > 0) {
@@ -556,7 +568,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     }
   }
 
-  // ── Tool callbacks ──────────────────────────────────────────────────
+  // -- Tool callbacks ---------------------------------------------------------
 
   async handleToolStart(
     tool: Serialized,
@@ -621,7 +633,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     }
   }
 
-  // ── Retriever callbacks ─────────────────────────────────────────────
+  // -- Retriever callbacks ----------------------------------------------------
 
   async handleRetrieverStart(
     retriever: Serialized,
@@ -673,7 +685,7 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     }
   }
 
-  // ── Accessors ───────────────────────────────────────────────────────
+  // -- Accessors --------------------------------------------------------------
 
   /** Get the current active trace ID (null if no run is active). */
   get traceId(): string | null {

@@ -1,12 +1,28 @@
 /**
  * WebSocket client for remote tool invocation.
+ *
+ * Tool execution is isolated: handleInvoke fires-and-forgets so the WS
+ * message handler is never blocked, allowing heartbeats to continue.
  */
+import { AsyncLocalStorage } from "node:async_hooks";
 import WebSocket from "ws";
-import type { ServerMessage } from "./types.js";
+import type { ServerMessage, ToolRegistryEntry } from "./types.js";
 import { _getToolRegistry } from "./trace.js";
 import { generateId } from "./utils.js";
+import { restoreContext } from "./context.js";
 import { sign, verify, NonceTracker } from "./security.js";
 import { jsonSerializable } from "./utils.js";
+
+/** AsyncLocalStorage for invoke state -- tools can access via getInvokeState(). */
+const invokeStateStorage = new AsyncLocalStorage<unknown>();
+
+/**
+ * Get the state passed with the current tool invocation.
+ * Returns undefined if not in an invocation context or no state was provided.
+ */
+export function getInvokeState(): unknown {
+  return invokeStateStorage.getStore();
+}
 
 export class ToolClient {
   private host: string;
@@ -156,11 +172,15 @@ export class ToolClient {
     }, this.heartbeatInterval);
   }
 
-  private async handleInvoke(
+  /**
+   * Handle an invoke message. Validates signature and nonce, then fires off
+   * isolated execution without blocking the WS message handler.
+   */
+  private handleInvoke(
     ws: WebSocket,
-    msg: { nonce: string; tool: string; input: unknown; signature: string },
-  ): Promise<void> {
-    const { nonce, tool, input, signature: sig } = msg;
+    msg: { nonce: string; tool: string; input: unknown; state?: unknown; signature: string },
+  ): void {
+    const { nonce, tool, input, state, signature: sig } = msg;
 
     // Verify HMAC
     if (!this.sessionToken || !verify(this.sessionToken, nonce, tool, input, sig)) {
@@ -190,40 +210,87 @@ export class ToolClient {
       return;
     }
 
-    const start = performance.now();
-    try {
-      let output: unknown;
-      if (input && typeof input === "object" && !Array.isArray(input)) {
-        output = await entry.fn(input);
-      } else {
-        output = input !== null && input !== undefined ? await entry.fn(input) : await entry.fn();
-      }
-      const durationMs = Math.round(performance.now() - start);
-      output = jsonSerializable(output);
+    // Fire and forget -- don't block the WS message handler
+    this.executeToolIsolated(ws, nonce, tool, input, state, entry).catch((err) =>
+      console.error("[lightrace] Tool execution error:", err),
+    );
+  }
 
-      ws.send(
-        JSON.stringify({
-          type: "result",
-          nonce,
-          output,
-          durationMs,
-          signature: sign(this.sessionToken, nonce, tool, output),
+  /**
+   * Execute a tool invocation in isolation with a timeout.
+   * Runs outside the WS message handler so heartbeats continue flowing.
+   */
+  private async executeToolIsolated(
+    ws: WebSocket,
+    nonce: string,
+    tool: string,
+    input: unknown,
+    state: unknown,
+    entry: ToolRegistryEntry,
+  ): Promise<void> {
+    // Restore registered context variables from __lightrace_context
+    const contextData =
+      state &&
+      typeof state === "object" &&
+      "__lightrace_context" in (state as Record<string, unknown>)
+        ? ((state as Record<string, unknown>).__lightrace_context as Record<string, unknown>)
+        : {};
+    if (contextData && typeof contextData === "object") {
+      restoreContext(contextData);
+    }
+
+    const start = performance.now();
+    const timeoutMs = 30_000;
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const output = await Promise.race([
+        invokeStateStorage.run(state ?? null, async () => {
+          let result: unknown;
+          if (input && typeof input === "object" && !Array.isArray(input)) {
+            result = await entry.fn(input);
+          } else {
+            result =
+              input !== null && input !== undefined ? await entry.fn(input) : await entry.fn();
+          }
+          return jsonSerializable(result);
         }),
-      );
+        new Promise<never>((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error("Tool execution timed out")), timeoutMs);
+        }),
+      ]);
+      clearTimeout(timeoutId);
+
+      const durationMs = Math.round(performance.now() - start);
+
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "result",
+            nonce,
+            output,
+            durationMs,
+            signature: sign(this.sessionToken!, nonce, tool, output),
+          }),
+        );
+      }
     } catch (err) {
+      clearTimeout(timeoutId);
       const durationMs = Math.round(performance.now() - start);
       const error = err instanceof Error ? err.message : String(err);
 
-      ws.send(
-        JSON.stringify({
-          type: "result",
-          nonce,
-          output: null,
-          error,
-          durationMs,
-          signature: sign(this.sessionToken, nonce, tool, null),
-        }),
-      );
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: "result",
+            nonce,
+            output: null,
+            error,
+            durationMs,
+            signature: sign(this.sessionToken!, nonce, tool, null),
+          }),
+        );
+      }
     }
   }
 }

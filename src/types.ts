@@ -88,6 +88,7 @@ export type ServerMessage =
       nonce: string;
       tool: string;
       input: unknown;
+      state?: unknown;
       signature: string;
     }
   | { type: "heartbeat_ack" }

@@ -1,22 +1,17 @@
 /**
  * Unified trace() wrapper for all observation types.
+ *
+ * Uses OpenTelemetry for trace/span context propagation and export.
  */
-import { AsyncLocalStorage } from "node:async_hooks";
-import type { TraceEvent, TraceOptions, ToolRegistryEntry } from "./types.js";
-import { EVENT_TYPE_MAP, OBSERVATION_TYPE_ENUM } from "./types.js";
+import { context, trace as otelTrace, type Span } from "@opentelemetry/api";
+import type { LightraceOtelExporter } from "./otel-exporter.js";
+import * as attrs from "./otel-exporter.js";
+import type { TraceOptions, ToolRegistryEntry } from "./types.js";
+import { OBSERVATION_TYPE_ENUM } from "./types.js";
 import { generateId, jsonSerializable, zodToJsonSchema } from "./utils.js";
-import type { BatchExporter } from "./exporter.js";
 
-/** Context for trace propagation. */
-interface TraceContext {
-  traceId: string;
-  observationId: string | null;
-}
-
-const asyncStorage = new AsyncLocalStorage<TraceContext>();
-
-/** Global exporter reference (set by Client). */
-let _exporter: BatchExporter | null = null;
+/** Global OTel exporter reference (set by Client). */
+let _otelExporter: LightraceOtelExporter | null = null;
 
 /** Client-level defaults (set by Client to avoid circular imports). */
 let _clientDefaults: { userId?: string; sessionId?: string } = {};
@@ -24,29 +19,86 @@ let _clientDefaults: { userId?: string; sessionId?: string } = {};
 /** Global tool registry for invocable tools. */
 const _toolRegistry = new Map<string, ToolRegistryEntry>();
 
-export function _setExporter(exporter: BatchExporter | null): void {
-  _exporter = exporter;
+export function _setOtelExporter(exporter: LightraceOtelExporter | null): void {
+  _otelExporter = exporter;
+}
+
+export function _getOtelExporter(): LightraceOtelExporter | null {
+  return _otelExporter;
 }
 
 export function _setClientDefaults(defaults: { userId?: string; sessionId?: string }): void {
   _clientDefaults = defaults;
 }
 
-/** Get the current trace context (used by imperative API). */
-export function _getTraceContext(): TraceContext | undefined {
-  return asyncStorage.getStore();
+/** Get the current trace context from OTel's active span. */
+export function _getTraceContext(): { traceId: string; observationId: string | null } | undefined {
+  const span = otelTrace.getActiveSpan();
+  if (!span) return undefined;
+  const ctx = span.spanContext();
+  return {
+    traceId: ctx.traceId,
+    observationId: ctx.spanId,
+  };
 }
 
 export function _getToolRegistry(): Map<string, ToolRegistryEntry> {
   return _toolRegistry;
 }
 
+/** Helper to set span attributes for a root trace or child observation. */
+function setSpanAttributes(
+  span: Span,
+  opts: {
+    isRoot: boolean;
+    obsType: string | null;
+    obsName: string;
+    input: unknown;
+    output: unknown;
+    model: string | null;
+    metadata: Record<string, unknown> | null;
+    level: string;
+    statusMessage?: string | null;
+    userId?: string;
+    sessionId?: string;
+    usage?: {
+      promptTokens?: number;
+      completionTokens?: number;
+      totalTokens?: number;
+    } | null;
+  },
+): void {
+  if (opts.isRoot) {
+    span.setAttribute(attrs.AS_ROOT, "true");
+    span.setAttribute(attrs.TRACE_NAME, opts.obsName);
+    span.setAttribute(attrs.TRACE_INPUT, attrs.safeJson(opts.input));
+    span.setAttribute(attrs.TRACE_OUTPUT, attrs.safeJson(opts.output));
+    if (opts.metadata) span.setAttribute(attrs.TRACE_METADATA, attrs.safeJson(opts.metadata));
+    if (opts.userId) span.setAttribute(attrs.TRACE_USER_ID, opts.userId);
+    if (opts.sessionId) span.setAttribute(attrs.TRACE_SESSION_ID, opts.sessionId);
+  } else {
+    span.setAttribute(
+      attrs.OBSERVATION_TYPE,
+      OBSERVATION_TYPE_ENUM[opts.obsType!] ?? opts.obsType ?? "SPAN",
+    );
+    span.setAttribute(attrs.OBSERVATION_INPUT, attrs.safeJson(opts.input));
+    span.setAttribute(attrs.OBSERVATION_OUTPUT, attrs.safeJson(opts.output));
+    if (opts.metadata) span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(opts.metadata));
+    if (opts.model) span.setAttribute(attrs.OBSERVATION_MODEL, opts.model);
+    span.setAttribute(attrs.OBSERVATION_LEVEL, opts.level);
+    if (opts.statusMessage) span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, opts.statusMessage);
+    if (opts.usage) {
+      span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(opts.usage));
+    }
+  }
+}
+
 /**
  * Unified trace wrapper.
  *
  * Signatures:
- *   trace(name, fn)              — root trace (no options)
- *   trace(name, options, fn)     — with options
+ *   trace(name, fn)              -- root trace (no options)
+ *   trace(name, options, fn)     -- with options
  */
 export function trace<T extends (...args: any[]) => any>(
   name: string,
@@ -85,107 +137,97 @@ export function trace<T extends (...args: any[]) => any>(
   }
 
   const wrapped = ((...args: unknown[]) => {
+    const tracer = _otelExporter?.tracer;
+    if (!tracer) return fn(...args);
+
     const isRoot = obsType === null;
-    const entityId = generateId();
-    const startTime = new Date();
 
-    // Get parent context
-    const parentCtx = asyncStorage.getStore();
-    const traceId = isRoot ? entityId : (parentCtx?.traceId ?? generateId());
-    const parentObservationId = isRoot ? null : (parentCtx?.observationId ?? null);
+    return tracer.startActiveSpan(obsName, (span) => {
+      const execute = () => {
+        try {
+          const capturedInput = jsonSerializable(args.length === 1 ? args[0] : args);
+          const result = fn(...args);
 
-    // Set context for children
-    const childCtx: TraceContext = {
-      traceId,
-      observationId: isRoot ? null : entityId,
-    };
+          // Handle async functions
+          if (result && typeof result === "object" && typeof result.then === "function") {
+            return (result as Promise<unknown>).then(
+              (resolved) => {
+                setSpanAttributes(span, {
+                  isRoot,
+                  obsType,
+                  obsName,
+                  input: capturedInput,
+                  output: jsonSerializable(resolved),
+                  model,
+                  metadata: staticMetadata,
+                  level: "DEFAULT",
+                  userId,
+                  sessionId,
+                  usage,
+                });
+                span.end();
+                return resolved;
+              },
+              (err: Error) => {
+                setSpanAttributes(span, {
+                  isRoot,
+                  obsType,
+                  obsName,
+                  input: capturedInput,
+                  output: null,
+                  model,
+                  metadata: staticMetadata,
+                  level: "ERROR",
+                  statusMessage: err.message,
+                  userId,
+                  sessionId,
+                  usage,
+                });
+                span.end();
+                throw err;
+              },
+            );
+          }
 
-    const emitEvent = (output: unknown, level: string, statusMessage: string | null) => {
-      const endTime = new Date();
-      const capturedInput = jsonSerializable(args.length === 1 ? args[0] : args);
-
-      if (isRoot) {
-        const body: Record<string, unknown> = {
-          id: entityId,
-          name: obsName,
-          timestamp: startTime.toISOString(),
-          input: capturedInput,
-          output: jsonSerializable(output),
-          metadata: staticMetadata,
-        };
-        if (userId !== undefined) body.userId = userId;
-        if (sessionId !== undefined) body.sessionId = sessionId;
-
-        const event: TraceEvent = {
-          id: generateId(),
-          type: "trace-create",
-          timestamp: startTime.toISOString(),
-          body,
-        };
-        _exporter?.enqueue(event);
-      } else {
-        const createType = EVENT_TYPE_MAP[obsType!]?.[0] ?? "span-create";
-        const body: Record<string, unknown> = {
-          id: entityId,
-          traceId,
-          type: OBSERVATION_TYPE_ENUM[obsType!] ?? obsType,
-          name: obsName,
-          startTime: startTime.toISOString(),
-          endTime: endTime.toISOString(),
-          input: capturedInput,
-          output: jsonSerializable(output),
-          metadata: staticMetadata,
-          model,
-          level,
-          statusMessage,
-          parentObservationId,
-        };
-        // Add usage fields for generation observations
-        if (usage && obsType === "generation") {
-          if (usage.promptTokens !== undefined) body.promptTokens = usage.promptTokens;
-          if (usage.completionTokens !== undefined) body.completionTokens = usage.completionTokens;
-          if (usage.totalTokens !== undefined) body.totalTokens = usage.totalTokens;
+          // Sync result
+          setSpanAttributes(span, {
+            isRoot,
+            obsType,
+            obsName,
+            input: capturedInput,
+            output: jsonSerializable(result),
+            model,
+            metadata: staticMetadata,
+            level: "DEFAULT",
+            userId,
+            sessionId,
+            usage,
+          });
+          span.end();
+          return result;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          setSpanAttributes(span, {
+            isRoot,
+            obsType,
+            obsName,
+            input: jsonSerializable(args.length === 1 ? args[0] : args),
+            output: null,
+            model,
+            metadata: staticMetadata,
+            level: "ERROR",
+            statusMessage: message,
+            userId,
+            sessionId,
+            usage,
+          });
+          span.end();
+          throw err;
         }
+      };
 
-        const event: TraceEvent = {
-          id: generateId(),
-          type: createType,
-          timestamp: startTime.toISOString(),
-          body,
-        };
-        _exporter?.enqueue(event);
-      }
-    };
-
-    const execute = () => {
-      try {
-        const result = fn(...args);
-
-        // Handle async functions
-        if (result && typeof result === "object" && typeof result.then === "function") {
-          return (result as Promise<unknown>).then(
-            (resolved) => {
-              emitEvent(resolved, "DEFAULT", null);
-              return resolved;
-            },
-            (err: Error) => {
-              emitEvent(null, "ERROR", err.message ?? String(err));
-              throw err;
-            },
-          );
-        }
-
-        // Sync result
-        emitEvent(result, "DEFAULT", null);
-        return result;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        emitEvent(null, "ERROR", message);
-        throw err;
-      }
-    };
-
-    return asyncStorage.run(childCtx, execute);
+      return execute();
+    });
   }) as unknown as T;
 
   // Preserve function name

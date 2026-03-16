@@ -1,16 +1,19 @@
 /**
  * Imperative Observation handle for span / generation / event.
+ *
+ * Uses OpenTelemetry spans for export instead of the legacy BatchExporter.
  */
-import type { TraceEvent, UsageDetails } from "./types.js";
-import { EVENT_TYPE_MAP, OBSERVATION_TYPE_ENUM } from "./types.js";
+import type { UsageDetails } from "./types.js";
+import { OBSERVATION_TYPE_ENUM } from "./types.js";
 import { generateId, jsonSerializable } from "./utils.js";
-import type { BatchExporter } from "./exporter.js";
+import type { LightraceOtelExporter } from "./otel-exporter.js";
+import * as attrs from "./otel-exporter.js";
 
 export interface ObservationOptions {
   traceId: string;
   type: "span" | "generation" | "event";
   name: string;
-  exporter: BatchExporter | null;
+  otelExporter: LightraceOtelExporter | null;
   startTime?: Date;
   parentObservationId?: string;
   input?: unknown;
@@ -24,7 +27,7 @@ export class Observation {
   readonly traceId: string;
   readonly type: "span" | "generation" | "event";
   readonly name: string;
-  private readonly exporter: BatchExporter | null;
+  private readonly otelExporter: LightraceOtelExporter | null;
   private readonly startTime: Date;
   private readonly parentObservationId: string | undefined;
 
@@ -42,7 +45,7 @@ export class Observation {
     this.traceId = opts.traceId;
     this.type = opts.type;
     this.name = opts.name;
-    this.exporter = opts.exporter;
+    this.otelExporter = opts.otelExporter;
     this.startTime = opts.startTime ?? new Date();
     this.parentObservationId = opts.parentObservationId;
     this.input = opts.input;
@@ -72,47 +75,38 @@ export class Observation {
   }
 
   /**
-   * End the observation and emit the trace event.
+   * End the observation and emit it as an OTel span.
    */
   end(): void {
     if (this.ended) return;
     this.ended = true;
 
-    const endTime = new Date();
-    const createType = EVENT_TYPE_MAP[this.type]?.[0] ?? "span-create";
+    const tracer = this.otelExporter?.tracer;
+    if (!tracer) return;
 
-    const body: Record<string, unknown> = {
-      id: this.id,
-      traceId: this.traceId,
-      type: OBSERVATION_TYPE_ENUM[this.type] ?? this.type,
-      name: this.name,
-      startTime: this.startTime.toISOString(),
-      endTime: endTime.toISOString(),
-      input: jsonSerializable(this.input),
-      output: jsonSerializable(this.output),
-      metadata: this.metadata ?? null,
-      model: this.model ?? null,
-      level: this.level,
-      statusMessage: this.statusMessage ?? null,
-      parentObservationId: this.parentObservationId ?? null,
-    };
+    // Create a span with the start time
+    const span = tracer.startSpan(this.name, { startTime: this.startTime });
 
-    // Add usage fields for generations
+    // Set observation attributes
+    span.setAttribute(attrs.OBSERVATION_TYPE, OBSERVATION_TYPE_ENUM[this.type] ?? this.type);
+    span.setAttribute(attrs.OBSERVATION_INPUT, attrs.safeJson(jsonSerializable(this.input)));
+    span.setAttribute(attrs.OBSERVATION_OUTPUT, attrs.safeJson(jsonSerializable(this.output)));
+    span.setAttribute(attrs.OBSERVATION_LEVEL, this.level);
+
+    if (this.metadata) {
+      span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(this.metadata));
+    }
+    if (this.model) {
+      span.setAttribute(attrs.OBSERVATION_MODEL, this.model);
+    }
+    if (this.statusMessage) {
+      span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, this.statusMessage);
+    }
     if (this.usage) {
-      if (this.usage.promptTokens !== undefined) body.promptTokens = this.usage.promptTokens;
-      if (this.usage.completionTokens !== undefined)
-        body.completionTokens = this.usage.completionTokens;
-      if (this.usage.totalTokens !== undefined) body.totalTokens = this.usage.totalTokens;
+      span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(this.usage));
     }
 
-    const event: TraceEvent = {
-      id: generateId(),
-      type: createType,
-      timestamp: this.startTime.toISOString(),
-      body,
-    };
-
-    this.exporter?.enqueue(event);
+    span.end();
   }
 
   /**
@@ -123,7 +117,7 @@ export class Observation {
       traceId: this.traceId,
       type: "span",
       name: opts.name,
-      exporter: this.exporter,
+      otelExporter: this.otelExporter,
       input: opts.input,
       metadata: opts.metadata,
       parentObservationId: this.id,
