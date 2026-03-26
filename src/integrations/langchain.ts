@@ -438,11 +438,20 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
         }),
       );
 
+      // Include tool definitions in input when present
+      const invocationParams = extraParams?.["invocation_params"] as
+        | Record<string, unknown>
+        | undefined;
+      const tools = invocationParams?.["tools"] ?? invocationParams?.["functions"] ?? undefined;
+      const messagesInput =
+        formattedMessages.length === 1 ? formattedMessages[0] : formattedMessages;
+      const input = tools ? { messages: messagesInput, tools } : messagesInput;
+
       this.registerRun(runId, parentRunId, {
         type: "generation",
         name: resolvedName,
         startTime: new Date(),
-        input: formattedMessages.length === 1 ? formattedMessages[0] : formattedMessages,
+        input,
         model,
         metadata,
         modelParameters,
