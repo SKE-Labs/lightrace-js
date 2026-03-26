@@ -193,6 +193,9 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
       "top_p",
       "frequency_penalty",
       "presence_penalty",
+      "tools",
+      "functions",
+      "tool_choice",
     ]) {
       const val = invocationParams?.[key];
       if (val !== undefined && val !== null) modelParameters[key] = val;
