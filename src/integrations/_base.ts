@@ -5,7 +5,7 @@
  * with `lightrace.*` attributes, and `normalizeUsage` for multi-provider
  * token usage extraction.
  */
-import type { Span, Tracer } from "@opentelemetry/api";
+import { trace as otelTrace, type Span, type Tracer } from "@opentelemetry/api";
 import { generateId, jsonSerializable } from "../utils.js";
 import type { LightraceOtelExporter } from "../otel-exporter.js";
 import * as attrs from "../otel-exporter.js";
@@ -82,8 +82,9 @@ export class TracingMixin {
 
   protected otelExporter: LightraceOtelExporter | null = null;
 
-  /** Root span for the current trace. */
   protected rootSpan: Span | null = null;
+  /** True when rootSpan was borrowed from an existing trace() wrapper (don't end it). */
+  private borrowedRootSpan = false;
 
   /** The trace ID from the most recently completed root run. */
   lastTraceId: string | null = null;
@@ -115,9 +116,16 @@ export class TracingMixin {
 
     if (isRoot) {
       this.rootRunId = runId;
-      this._traceId = generateId();
 
-      if (tracer) {
+      const activeSpan = otelTrace.getActiveSpan();
+
+      if (activeSpan) {
+        // Reuse the existing trace span — don't create a duplicate root.
+        this.rootSpan = activeSpan;
+        this.borrowedRootSpan = true;
+        this._traceId = activeSpan.spanContext().traceId;
+      } else if (tracer) {
+        this._traceId = generateId();
         this.rootSpan = tracer.startSpan(this.traceName ?? info.name, {
           startTime: info.startTime,
         });
@@ -129,6 +137,8 @@ export class TracingMixin {
         if (this.rootMetadata) {
           this.rootSpan.setAttribute(attrs.TRACE_METADATA, attrs.safeJson(this.rootMetadata));
         }
+      } else {
+        this._traceId = generateId();
       }
     }
 
@@ -224,13 +234,16 @@ export class TracingMixin {
     if (runId === this.rootRunId) {
       if (this.rootSpan) {
         this.rootSpan.setAttribute(attrs.TRACE_OUTPUT, attrs.safeJson(jsonSerializable(output)));
-        this.rootSpan.end();
+        if (!this.borrowedRootSpan) {
+          this.rootSpan.end();
+        }
         this.rootSpan = null;
       }
 
       this.lastTraceId = this._traceId;
       this.rootRunId = null;
       this._traceId = null;
+      this.borrowedRootSpan = false;
       this.runs.clear();
       this.runParents.clear();
       this.completionStartTimes.clear();

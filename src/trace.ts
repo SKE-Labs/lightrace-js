@@ -146,7 +146,8 @@ export function trace<T extends (...args: any[]) => any>(
     return tracer.startActiveSpan(obsName, (span) => {
       const execute = () => {
         try {
-          const capturedInput = jsonSerializable(args.length === 1 ? args[0] : args);
+          const capturedInput =
+            args.length === 0 ? null : jsonSerializable(args.length === 1 ? args[0] : args);
           const result = fn(...args);
 
           // Handle async functions
@@ -212,7 +213,7 @@ export function trace<T extends (...args: any[]) => any>(
             isRoot,
             obsType,
             obsName,
-            input: jsonSerializable(args.length === 1 ? args[0] : args),
+            input: args.length === 0 ? null : jsonSerializable(args.length === 1 ? args[0] : args),
             output: null,
             model,
             metadata: staticMetadata,

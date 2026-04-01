@@ -1,6 +1,14 @@
-import { trace as otelTrace, type Tracer } from "@opentelemetry/api";
+import {
+  trace as otelTrace,
+  context as otelContext,
+  ROOT_CONTEXT,
+  type Context,
+  type ContextManager,
+  type Tracer,
+} from "@opentelemetry/api";
 import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // Lightrace OTel span attribute keys — trace-level
 export const TRACE_NAME = "lightrace.trace.name";
@@ -41,6 +49,37 @@ export function safeJson(value: unknown): string {
   }
 }
 
+let contextManagerRegistered = false;
+
+function ensureContextManager(): void {
+  if (contextManagerRegistered) return;
+  contextManagerRegistered = true;
+
+  const als = new AsyncLocalStorage<Context>();
+  const manager: ContextManager = {
+    active: () => als.getStore() ?? ROOT_CONTEXT,
+    with<A extends unknown[], F extends (...args: A) => ReturnType<F>>(
+      ctx: Context,
+      fn: F,
+      thisArg?: ThisParameterType<F>,
+      ...args: A
+    ): ReturnType<F> {
+      return als.run(ctx, () => fn.call(thisArg, ...args)) as ReturnType<F>;
+    },
+    bind<T>(ctx: Context, fn: T): T {
+      return ((...args: unknown[]) =>
+        als.run(ctx, () => (fn as Function)(...args))) as unknown as T;
+    },
+    enable() {
+      return this;
+    },
+    disable() {
+      return this;
+    },
+  };
+  otelContext.setGlobalContextManager(manager);
+}
+
 export class LightraceOtelExporter {
   private provider: BasicTracerProvider;
   private _tracer: Tracer;
@@ -68,6 +107,9 @@ export class LightraceOtelExporter {
         }),
       ],
     });
+
+    // Register context manager so startActiveSpan propagates context to child spans
+    ensureContextManager();
 
     this._tracer = this.provider.getTracer("lightrace-js", "0.2.0");
   }
