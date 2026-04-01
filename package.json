@@ -52,7 +52,7 @@
     "hono": "^4.8.3"
   },
   "devDependencies": {
-    "@eslint/js": "^9.0.0",
+    "@eslint/js": "^10.0.1",
     "@langchain/core": "^1.1.32",
     "@types/node": "^22.0.0",
     "eslint": "^9.0.0",
