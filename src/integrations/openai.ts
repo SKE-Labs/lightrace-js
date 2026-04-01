@@ -16,7 +16,7 @@
  * ```
  */
 import { generateId, jsonSerializable } from "../utils.js";
-import { TracingMixin, normalizeUsage, type TracingMixinOptions } from "./_base.js";
+import { TracingMixin, type TracingMixinOptions } from "./_base.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyFn = (...args: any[]) => any;
@@ -52,8 +52,6 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
       originalResponsesCreate?: AnyFn;
     } = {};
 
-    const self = this;
-
     // Patch chat.completions.create
     const completions = c?.chat?.completions;
     if (completions?.create) {
@@ -61,13 +59,13 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
       entry.completions = completions;
       entry.originalChatCreate = originalChatCreate;
 
-      completions.create = async function (...args: unknown[]) {
+      completions.create = async (...args: unknown[]) => {
         const kwargs =
           args.length === 1 && typeof args[0] === "object" && args[0] !== null
             ? (args[0] as Record<string, unknown>)
             : {};
 
-        const { runId, stream } = self.startChatTrace(kwargs);
+        const { runId, stream } = this.startChatTrace(kwargs);
 
         try {
           const result = await originalChatCreate(...args);
@@ -75,14 +73,14 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
           if (!stream) {
             const output = extractChatOutput(result);
             const usage = extractUsage(result);
-            self.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
+            this.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
           } else {
-            self.endRun(runId, { streaming: true });
+            this.endRun(runId, { streaming: true });
           }
 
           return result;
         } catch (err) {
-          self.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+          this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
           throw err;
         }
       };
@@ -95,13 +93,13 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
       entry.responses = responses;
       entry.originalResponsesCreate = originalResponsesCreate;
 
-      responses.create = async function (...args: unknown[]) {
+      responses.create = async (...args: unknown[]) => {
         const kwargs =
           args.length === 1 && typeof args[0] === "object" && args[0] !== null
             ? (args[0] as Record<string, unknown>)
             : {};
 
-        const { runId, stream } = self.startResponsesTrace(kwargs);
+        const { runId, stream } = this.startResponsesTrace(kwargs);
 
         try {
           const result = await originalResponsesCreate(...args);
@@ -109,14 +107,14 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
           if (!stream) {
             const output = extractResponsesOutput(result);
             const usage = extractUsage(result);
-            self.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
+            this.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
           } else {
-            self.endRun(runId, { streaming: true });
+            this.endRun(runId, { streaming: true });
           }
 
           return result;
         } catch (err) {
-          self.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+          this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
           throw err;
         }
       };
@@ -131,12 +129,12 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
   uninstrument(client: unknown): void {
     const entry = this.patchedTargets.get(client);
     if (!entry) return;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (entry.completions && entry.originalChatCreate) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (entry.completions as any).create = entry.originalChatCreate;
     }
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (entry.responses && entry.originalResponsesCreate) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (entry.responses as any).create = entry.originalResponsesCreate;
     }
     this.patchedTargets.delete(client);

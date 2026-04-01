@@ -5,7 +5,7 @@
  * with `lightrace.*` attributes, and `normalizeUsage` for multi-provider
  * token usage extraction.
  */
-import { trace as otelTrace, type Span, type Tracer } from "@opentelemetry/api";
+import { trace as otelTrace, type Span } from "@opentelemetry/api";
 import { generateId, jsonSerializable } from "../utils.js";
 import type { LightraceOtelExporter } from "../otel-exporter.js";
 import * as attrs from "../otel-exporter.js";

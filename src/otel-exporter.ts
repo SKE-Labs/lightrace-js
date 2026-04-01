@@ -1,5 +1,4 @@
 import {
-  trace as otelTrace,
   context as otelContext,
   ROOT_CONTEXT,
   type Context,
@@ -68,6 +67,7 @@ function ensureContextManager(): void {
     },
     bind<T>(ctx: Context, fn: T): T {
       return ((...args: unknown[]) =>
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
         als.run(ctx, () => (fn as Function)(...args))) as unknown as T;
     },
     enable() {

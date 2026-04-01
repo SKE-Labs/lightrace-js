@@ -16,7 +16,7 @@
  * ```
  */
 import { generateId, jsonSerializable } from "../utils.js";
-import { TracingMixin, normalizeUsage, type TracingMixinOptions } from "./_base.js";
+import { TracingMixin, type TracingMixinOptions } from "./_base.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyFn = (...args: any[]) => any;
@@ -50,16 +50,14 @@ export class LightraceAnthropicInstrumentor extends TracingMixin {
       originalStream,
     });
 
-    const self = this;
-
     // Patch messages.create
-    messages.create = async function (...args: unknown[]) {
+    messages.create = async (...args: unknown[]) => {
       const kwargs =
         args.length === 1 && typeof args[0] === "object" && args[0] !== null
           ? (args[0] as Record<string, unknown>)
           : {};
 
-      const { runId } = self.startAnthropicTrace(kwargs);
+      const { runId } = this.startAnthropicTrace(kwargs);
       const stream = Boolean(kwargs.stream);
 
       try {
@@ -68,36 +66,36 @@ export class LightraceAnthropicInstrumentor extends TracingMixin {
         if (!stream) {
           const output = extractOutput(result);
           const usage = extractUsage(result);
-          self.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
+          this.endRun(runId, output, "DEFAULT", null, usage ?? undefined);
         } else {
           // For streaming, end immediately with partial info
-          self.endRun(runId, { streaming: true });
+          this.endRun(runId, { streaming: true });
         }
 
         return result;
       } catch (err) {
-        self.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+        this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
         throw err;
       }
     };
 
     // Patch messages.stream (separate context-manager streaming API)
     if (originalStream) {
-      messages.stream = function (...args: unknown[]) {
+      messages.stream = (...args: unknown[]) => {
         const kwargs =
           args.length === 1 && typeof args[0] === "object" && args[0] !== null
             ? (args[0] as Record<string, unknown>)
             : {};
 
-        const { runId } = self.startAnthropicTrace(kwargs);
+        const { runId } = this.startAnthropicTrace(kwargs);
 
         try {
           const streamManager = originalStream(...args);
 
           // Wrap the stream manager to capture the final message
-          return wrapStreamManager(streamManager, self, runId);
+          return wrapStreamManager(streamManager, this, runId);
         } catch (err) {
-          self.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+          this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
           throw err;
         }
       };

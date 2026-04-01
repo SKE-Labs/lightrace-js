@@ -13,7 +13,7 @@
  * ```
  */
 import { generateId, jsonSerializable } from "../utils.js";
-import { TracingMixin, normalizeUsage, type TracingMixinOptions } from "./_base.js";
+import { TracingMixin, type TracingMixinOptions } from "./_base.js";
 
 /** Observation type mapping for LlamaIndex event types. */
 const EVENT_TYPE_MAP: Record<string, "generation" | "span" | "tool"> = {

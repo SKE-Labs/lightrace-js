@@ -3,12 +3,12 @@
  *
  * Uses OpenTelemetry for trace/span context propagation and export.
  */
-import { context, trace as otelTrace, type Span } from "@opentelemetry/api";
+import { trace as otelTrace, type Span } from "@opentelemetry/api";
 import type { LightraceOtelExporter } from "./otel-exporter.js";
 import * as attrs from "./otel-exporter.js";
 import type { TraceOptions, ToolRegistryEntry } from "./types.js";
 import { OBSERVATION_TYPE_ENUM } from "./types.js";
-import { generateId, jsonSerializable, zodToJsonSchema } from "./utils.js";
+import { jsonSerializable, zodToJsonSchema } from "./utils.js";
 
 /** Global OTel exporter reference (set by Client). */
 let _otelExporter: LightraceOtelExporter | null = null;
