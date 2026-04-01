@@ -209,7 +209,7 @@ export class TracingMixin {
     span.end();
   }
 
-  protected endRun(
+  endRun(
     runId: string,
     output: unknown,
     level = "DEFAULT",
