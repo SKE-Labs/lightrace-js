@@ -1,7 +1,7 @@
 {
   "name": "lightrace",
   "version": "0.1.7",
-  "description": "Lightweight LLM tracing SDK with remote tool invocation",
+  "description": "Agentic development kit — LLM tracing, tool management, and agent primitives",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,6 +13,18 @@
     "./integrations/langchain": {
       "import": "./dist/integrations/langchain.js",
       "types": "./dist/integrations/langchain.d.ts"
+    },
+    "./integrations/anthropic": {
+      "import": "./dist/integrations/anthropic.js",
+      "types": "./dist/integrations/anthropic.d.ts"
+    },
+    "./integrations/openai": {
+      "import": "./dist/integrations/openai.js",
+      "types": "./dist/integrations/openai.d.ts"
+    },
+    "./integrations/llamaindex": {
+      "import": "./dist/integrations/llamaindex.js",
+      "types": "./dist/integrations/llamaindex.d.ts"
     }
   },
   "files": [
@@ -33,16 +45,16 @@
     "precommit": "lint-staged"
   },
   "dependencies": {
+    "@hono/node-server": "^1.14.3",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.213.0",
     "@opentelemetry/sdk-trace-base": "^2.6.0",
-    "ws": "^8.18.0"
+    "hono": "^4.8.3"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",
     "@langchain/core": "^1.1.32",
     "@types/node": "^22.0.0",
-    "@types/ws": "^8.5.0",
     "eslint": "^9.0.0",
     "husky": "^9.1.0",
     "lint-staged": "^16.0.0",
@@ -54,6 +66,9 @@
   },
   "peerDependencies": {
     "@langchain/core": ">=0.2.0",
+    "@anthropic-ai/sdk": ">=0.30.0",
+    "openai": ">=4.0.0",
+    "llamaindex": ">=0.5.0",
     "zod": "^3.0.0"
   },
   "peerDependenciesMeta": {
@@ -61,6 +76,15 @@
       "optional": true
     },
     "@langchain/core": {
+      "optional": true
+    },
+    "@anthropic-ai/sdk": {
+      "optional": true
+    },
+    "openai": {
+      "optional": true
+    },
+    "llamaindex": {
       "optional": true
     }
   },
@@ -81,7 +105,9 @@
     "observability",
     "langfuse",
     "opentelemetry",
-    "tool-invocation"
+    "agent",
+    "adk",
+    "tool-management"
   ],
   "author": "Lightrace Contributors",
   "engines": {

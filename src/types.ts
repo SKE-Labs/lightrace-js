@@ -32,7 +32,7 @@ export interface TraceOptions {
   type?: ObservationType;
   /** Override observation name (defaults to the name argument). */
   name?: string;
-  /** For type="tool": register for remote invocation. Default: true. */
+  /** For type="tool": expose via dev server for dashboard invocation. Default: true. */
   invoke?: boolean;
   /** For type="generation": LLM model name. */
   model?: string;
@@ -60,36 +60,5 @@ export interface TraceEvent {
 export interface ToolRegistryEntry {
   fn: (...args: unknown[]) => unknown;
   inputSchema: Record<string, unknown> | null;
+  description?: string | null;
 }
-
-/** WebSocket messages from SDK to backend. */
-export type SdkMessage =
-  | {
-      type: "register";
-      sdkInstanceId: string;
-      tools: Array<{ name: string; inputSchema: unknown }>;
-    }
-  | {
-      type: "result";
-      nonce: string;
-      output: unknown;
-      error?: string;
-      durationMs: number;
-      signature: string;
-    }
-  | { type: "heartbeat" };
-
-/** WebSocket messages from backend to SDK. */
-export type ServerMessage =
-  | { type: "connected"; sessionToken: string }
-  | { type: "registered"; tools: string[] }
-  | {
-      type: "invoke";
-      nonce: string;
-      tool: string;
-      input: unknown;
-      state?: unknown;
-      signature: string;
-    }
-  | { type: "heartbeat_ack" }
-  | { type: "error"; message: string };

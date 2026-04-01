@@ -2,7 +2,7 @@
  * Main Lightrace SDK client.
  */
 import { LightraceOtelExporter } from "./otel-exporter.js";
-import * as attrs from "./otel-exporter.js";
+import { AS_ROOT, TRACE_NAME } from "./otel-exporter.js";
 import {
   _setOtelExporter,
   _getOtelExporter,
@@ -10,7 +10,7 @@ import {
   _getTraceContext,
   _getToolRegistry,
 } from "./trace.js";
-import { ToolClient } from "./tool-client.js";
+import { DevServer } from "./dev-server.js";
 import { Observation } from "./observation.js";
 import { generateId } from "./utils.js";
 import type { UsageDetails } from "./types.js";
@@ -19,8 +19,6 @@ export interface LightraceOptions {
   publicKey?: string;
   secretKey?: string;
   host?: string;
-  /** WebSocket host for tool connections (defaults to host if not set). */
-  wsHost?: string;
   flushAt?: number;
   flushInterval?: number;
   timeout?: number;
@@ -29,22 +27,27 @@ export interface LightraceOptions {
   userId?: string;
   /** Default session ID for all traces. */
   sessionId?: string;
+  /**
+   * Start the embedded dev server for tool invocation from the dashboard.
+   * Default: true. Set to false in production environments.
+   */
+  devServer?: boolean;
+  /** Port for the dev server (0 = auto-discover free port). Default: 0. */
+  devServerPort?: number;
 }
 
 export class Lightrace {
   private static instance: Lightrace | null = null;
 
   private otelExporter: LightraceOtelExporter | null = null;
-  private toolClient: ToolClient | null = null;
-  private toolConnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private _devServer: DevServer | null = null;
   private enabled: boolean;
   private host: string;
-  private wsHost: string | null;
   private publicKey: string;
   private secretKey: string;
-  /** Default user ID for all traces. */
+  private devServerEnabled: boolean;
+  private devServerPort: number;
   readonly userId: string | undefined;
-  /** Default session ID for all traces. */
   readonly sessionId: string | undefined;
 
   constructor(options: LightraceOptions = {}) {
@@ -54,11 +57,11 @@ export class Lightrace {
       /\/$/,
       "",
     );
-    this.wsHost =
-      (options.wsHost ?? process.env.LIGHTRACE_WS_HOST ?? "").replace(/\/$/, "") || null;
     this.enabled = options.enabled !== false;
     this.userId = options.userId;
     this.sessionId = options.sessionId;
+    this.devServerEnabled = options.devServer !== false;
+    this.devServerPort = options.devServerPort ?? 0;
 
     if (!this.enabled) return;
 
@@ -74,80 +77,71 @@ export class Lightrace {
     _setClientDefaults({ userId: this.userId, sessionId: this.sessionId });
     Lightrace.instance = this;
 
-    // Deferred tool client start -- gives trace() decorators time to register
-    this.toolConnectTimer = setTimeout(() => this.autoConnectTools(), 2000);
+    if (this.devServerEnabled) {
+      this.startDevServer();
+    }
   }
 
   static getInstance(): Lightrace | null {
     return Lightrace.instance;
   }
 
-  /** Get the OTel exporter (used by Observation). */
   getOtelExporter(): LightraceOtelExporter | null {
     return this.otelExporter;
   }
 
-  // -- Tool registration -------------------------------------------------------
+  getDevServer(): DevServer | null {
+    return this._devServer;
+  }
 
-  private autoConnectTools(): void {
-    this.toolConnectTimer = null;
-    if (!this.enabled || this.toolClient) return;
+  // -- Dev server + tool registration -----------------------------------------
+
+  private startDevServer(): void {
+    this._devServer = new DevServer({
+      port: this.devServerPort,
+      publicKey: this.publicKey,
+    });
+
+    this._devServer
+      .start()
+      .then((port) => {
+        console.log(`[lightrace] Dev server listening on http://127.0.0.1:${port}`);
+        this.registerToolsHttp();
+      })
+      .catch((err) => {
+        console.error("[lightrace] Failed to start dev server:", err);
+      });
+  }
+
+  private registerToolsHttp(): void {
     const registry = _getToolRegistry();
     if (registry.size === 0) return;
-    this.startToolClient();
-  }
 
-  private startToolClient(): void {
-    if (this.toolClient) return;
-    this.toolClient = new ToolClient({
-      host: this.wsHost ?? this.host,
-      publicKey: this.publicKey,
-      secretKey: this.secretKey,
-    });
-    this.toolClient.start();
-  }
+    const callbackUrl = this._devServer?.getCallbackUrl();
+    if (!callbackUrl) return;
 
-  /**
-   * Explicitly start the tool WebSocket client.
-   * Call this after all tools have been registered (via trace() or registerTools).
-   * Cancels the deferred auto-connect timer if still pending.
-   */
-  connectTools(): void {
-    if (this.toolConnectTimer) {
-      clearTimeout(this.toolConnectTimer);
-      this.toolConnectTimer = null;
-    }
-    if (!this.enabled) return;
-    this.startToolClient();
-  }
+    const tools = Array.from(registry.entries()).map(([name, entry]) => ({
+      name,
+      inputSchema: entry.inputSchema,
+      description: entry.description ?? null,
+    }));
 
-  /**
-   * Register tools for remote invocation.
-   *
-   * @param tools - Array of tool descriptors with name, fn, and optional inputSchema.
-   */
-  registerTools(
-    ...tools: Array<{
-      name: string;
-      fn: (...args: unknown[]) => unknown;
-      inputSchema?: Record<string, unknown> | null;
-    }>
-  ): void {
-    const registry = _getToolRegistry();
-    for (const tool of tools) {
-      registry.set(tool.name, {
-        fn: tool.fn,
-        inputSchema: tool.inputSchema ?? null,
+    const auth = Buffer.from(`${this.publicKey}:${this.secretKey}`).toString("base64");
+
+    fetch(`${this.host}/api/public/tools/register`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${auth}`,
+      },
+      body: JSON.stringify({ callbackUrl, tools }),
+    })
+      .then((res) => {
+        if (!res.ok) console.warn(`[lightrace] Tool registration returned ${res.status}`);
+      })
+      .catch((err) => {
+        console.error("[lightrace] Failed to register tools:", err.message);
       });
-    }
-
-    if (registry.size > 0 && this.enabled) {
-      if (this.toolConnectTimer) {
-        clearTimeout(this.toolConnectTimer);
-        this.toolConnectTimer = null;
-      }
-      this.startToolClient();
-    }
   }
 
   // -- Flush / shutdown --------------------------------------------------------
@@ -157,16 +151,13 @@ export class Lightrace {
   }
 
   async shutdown(): Promise<void> {
-    if (this.toolConnectTimer) {
-      clearTimeout(this.toolConnectTimer);
-      this.toolConnectTimer = null;
-    }
-    if (this.toolClient) {
-      this.toolClient.stop();
-      this.toolClient = null;
+    if (this._devServer) {
+      await this._devServer.stop();
+      this._devServer = null;
     }
     if (this.otelExporter) {
       await this.otelExporter.shutdown();
+      this.otelExporter = null;
       _setOtelExporter(null);
     }
     Lightrace.instance = null;
@@ -174,9 +165,6 @@ export class Lightrace {
 
   // -- Imperative observation API ----------------------------------------------
 
-  /**
-   * Create a span observation imperatively.
-   */
   span(opts: {
     name: string;
     input?: unknown;
@@ -187,9 +175,6 @@ export class Lightrace {
     return this._createObservation("span", opts);
   }
 
-  /**
-   * Create a generation observation imperatively.
-   */
   generation(opts: {
     name: string;
     input?: unknown;
@@ -202,9 +187,6 @@ export class Lightrace {
     return this._createObservation("generation", opts);
   }
 
-  /**
-   * Create an event observation imperatively (auto-ended).
-   */
   event(opts: {
     name: string;
     input?: unknown;
@@ -231,17 +213,15 @@ export class Lightrace {
   ): Observation {
     const otelExporter = this.otelExporter;
 
-    // Resolve trace context: explicit > OTel active span > create new root trace
     const ctx = _getTraceContext();
     let traceId = opts.traceId ?? ctx?.traceId;
-    const parentObservationId = opts.parentObservationId ?? ctx?.observationId ?? undefined;
+    const parentObservationId = opts.parentObservationId ?? ctx?.observationId;
 
-    // If no trace context, create an implicit root trace via OTel span
     if (!traceId && otelExporter) {
       const tracer = otelExporter.tracer;
       const rootSpan = tracer.startSpan(opts.name);
-      rootSpan.setAttribute(attrs.AS_ROOT, "true");
-      rootSpan.setAttribute(attrs.TRACE_NAME, opts.name);
+      rootSpan.setAttribute(AS_ROOT, "true");
+      rootSpan.setAttribute(TRACE_NAME, opts.name);
       traceId = rootSpan.spanContext().traceId;
       rootSpan.end();
     }
@@ -250,7 +230,7 @@ export class Lightrace {
       traceId = generateId();
     }
 
-    const obs = new Observation({
+    return new Observation({
       traceId,
       type,
       name: opts.name,
@@ -261,7 +241,5 @@ export class Lightrace {
       usage: opts.usage,
       parentObservationId: parentObservationId ?? undefined,
     });
-
-    return obs;
   }
 }

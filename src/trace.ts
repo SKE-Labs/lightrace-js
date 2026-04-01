@@ -127,12 +127,13 @@ export function trace<T extends (...args: any[]) => any>(
   const userId = options.userId ?? _clientDefaults.userId;
   const sessionId = options.sessionId ?? _clientDefaults.sessionId;
 
-  // Register tool for remote invocation
+  // Register tool for local execution + dev server invocation
   if (obsType === "tool" && invoke) {
     const inputSchema = options.inputSchema ? zodToJsonSchema(options.inputSchema) : null;
     _toolRegistry.set(obsName, {
       fn: fn as (...args: unknown[]) => unknown,
       inputSchema,
+      description: null,
     });
   }
 
