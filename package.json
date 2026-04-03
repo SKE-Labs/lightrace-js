@@ -1,6 +1,6 @@
 {
   "name": "lightrace",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Agentic development kit — LLM tracing, tool management, and agent primitives",
   "type": "module",
   "main": "./dist/index.js",
