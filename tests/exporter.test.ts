@@ -8,7 +8,7 @@ describe("BatchExporter", () => {
       .mockResolvedValue(new Response(null, { status: 207 }));
 
     const exporter = new BatchExporter({
-      host: "http://localhost:3002",
+      host: "http://localhost:3000",
       publicKey: "pk-test",
       secretKey: "sk-test",
       flushAt: 100,
@@ -29,7 +29,7 @@ describe("BatchExporter", () => {
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [url, opts] = fetchSpy.mock.calls[0];
-    expect(url).toBe("http://localhost:3002/api/public/ingestion");
+    expect(url).toBe("http://localhost:3000/api/public/ingestion");
     expect(opts?.method).toBe("POST");
 
     const body = JSON.parse(opts?.body as string);
@@ -42,7 +42,7 @@ describe("BatchExporter", () => {
 
   it("auto-flushes at threshold", () => {
     const exporter = new BatchExporter({
-      host: "http://localhost:3002",
+      host: "http://localhost:3000",
       publicKey: "pk-test",
       secretKey: "sk-test",
       flushAt: 2,
@@ -72,7 +72,7 @@ describe("BatchExporter", () => {
 
   it("sets correct auth header", () => {
     const exporter = new BatchExporter({
-      host: "http://localhost:3002",
+      host: "http://localhost:3000",
       publicKey: "pk-test",
       secretKey: "sk-test",
     });

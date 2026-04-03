@@ -16,7 +16,7 @@ import { Lightrace, trace } from "lightrace";
 const lt = new Lightrace({
   publicKey: "pk-lt-demo",
   secretKey: "sk-lt-demo",
-  host: "http://localhost:3002",
+  host: "http://localhost:3000",
 });
 
 // Root trace

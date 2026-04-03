@@ -53,7 +53,7 @@ export class Lightrace {
   constructor(options: LightraceOptions = {}) {
     this.publicKey = options.publicKey ?? process.env.LIGHTRACE_PUBLIC_KEY ?? "";
     this.secretKey = options.secretKey ?? process.env.LIGHTRACE_SECRET_KEY ?? "";
-    this.host = (options.host ?? process.env.LIGHTRACE_HOST ?? "http://localhost:3002").replace(
+    this.host = (options.host ?? process.env.LIGHTRACE_HOST ?? "http://localhost:3000").replace(
       /\/$/,
       "",
     );
