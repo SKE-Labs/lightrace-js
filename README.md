@@ -90,6 +90,112 @@ trace(name, options, fn);
 | `inputSchema` | `ZodType` | `undefined` | Optional Zod schema for tool input                       |
 | `metadata`    | `Record`  | `undefined` | Static metadata attached to every call                   |
 
+## Integrations
+
+### Anthropic
+
+```typescript
+import Anthropic from "@anthropic-ai/sdk";
+import { Lightrace, trace } from "lightrace";
+import { LightraceAnthropicInstrumentor } from "lightrace/integrations/anthropic";
+
+const lt = new Lightrace({ publicKey: "pk-lt-demo", secretKey: "sk-lt-demo" });
+
+const anthropic = new Anthropic();
+const instrumentor = new LightraceAnthropicInstrumentor({ client: lt });
+instrumentor.instrument(anthropic);
+
+const response = await anthropic.messages.create({
+  model: "claude-sonnet-4-20250514",
+  max_tokens: 256,
+  messages: [{ role: "user", content: "What is the capital of Mongolia?" }],
+});
+
+lt.flush();
+await lt.shutdown();
+```
+
+### OpenAI
+
+```typescript
+import OpenAI from "openai";
+import { Lightrace, trace } from "lightrace";
+import { LightraceOpenAIInstrumentor } from "lightrace/integrations/openai";
+
+const lt = new Lightrace({ publicKey: "pk-lt-demo", secretKey: "sk-lt-demo" });
+
+const openai = new OpenAI();
+const instrumentor = new LightraceOpenAIInstrumentor({ client: lt });
+instrumentor.instrument(openai);
+
+const response = await openai.chat.completions.create({
+  model: "gpt-4o-mini",
+  max_tokens: 256,
+  messages: [{ role: "user", content: "What is the speed of light?" }],
+});
+
+lt.flush();
+await lt.shutdown();
+```
+
+### LangChain
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+import { Lightrace } from "lightrace";
+import { LightraceCallbackHandler } from "lightrace/integrations/langchain";
+
+const lt = new Lightrace({ publicKey: "pk-lt-demo", secretKey: "sk-lt-demo" });
+
+const handler = new LightraceCallbackHandler({ client: lt });
+const model = new ChatOpenAI({ model: "gpt-4o-mini", maxTokens: 256 });
+
+const response = await model.invoke("What is the speed of light?", {
+  callbacks: [handler],
+});
+
+lt.flush();
+await lt.shutdown();
+```
+
+### Claude Agent SDK
+
+```typescript
+import { Lightrace } from "lightrace";
+import { tracedQuery } from "lightrace/integrations/claude-agent-sdk";
+
+const lt = new Lightrace({ publicKey: "pk-lt-demo", secretKey: "sk-lt-demo" });
+
+for await (const message of tracedQuery({
+  prompt: "What files are in the current directory?",
+  options: { maxTurns: 3 },
+  client: lt,
+  traceName: "file-lister",
+})) {
+  if (message.type === "result") {
+    const r = message as Record<string, unknown>;
+    console.log(r.result);
+    console.log(`Cost: $${r.total_cost_usd}`);
+  }
+}
+
+lt.flush();
+await lt.shutdown();
+```
+
+You can also use the handler directly for more control:
+
+```typescript
+import { query } from "@anthropic-ai/claude-agent-sdk";
+import { LightraceAgentHandler } from "lightrace/integrations/claude-agent-sdk";
+
+const handler = new LightraceAgentHandler({ prompt: "Hello", client: lt, traceName: "my-agent" });
+
+for await (const message of query({ prompt: "Hello" })) {
+  handler.handle(message);
+}
+```
+
 ## Compatibility
 
 Lightrace server also accepts traces from Langfuse Python/JS SDKs.

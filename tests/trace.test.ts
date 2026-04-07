@@ -317,3 +317,23 @@ describe("trace() - usage tracking for generations", () => {
     expect(usage.completionTokens).toBeUndefined();
   });
 });
+
+describe("trace() - edge cases", () => {
+  it("handles undefined return value", () => {
+    const fn = trace("void-fn", () => undefined);
+    const result = fn();
+    expect(result).toBeUndefined();
+
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+  });
+
+  it("handles null return value", () => {
+    const fn = trace("null-fn", () => null);
+    const result = fn();
+    expect(result).toBeNull();
+
+    const spans = memoryExporter.getFinishedSpans();
+    expect(spans).toHaveLength(1);
+  });
+});
