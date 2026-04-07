@@ -69,7 +69,15 @@ export class LightraceAgentHandler extends TracingMixin {
   private prompt: string | undefined;
   private agentRunId: string | null = null;
   private toolRunIds = new Map<string, string>(); // tool_use_id → runId
-  private turnCount = 0;
+  private initTools: string[] | null = null;
+  private initModel: string | null = null;
+
+  // Generation span accumulation — SDK yields multiple AssistantMessages
+  // per turn (thinking + tool_use) sharing the same message_id.
+  private currentGenRunId: string | null = null;
+  private currentMessageId: string | null = null;
+  private currentOutputBlocks: Record<string, unknown>[] = [];
+  private currentUsage: Record<string, number> | null = null;
 
   constructor(opts?: LightraceAgentHandlerOptions) {
     super(opts);
@@ -95,17 +103,26 @@ export class LightraceAgentHandler extends TracingMixin {
           this.onSystem(message);
           break;
       }
-    } catch {
+    } catch (err) {
       // Tracing errors should never break the agent loop
+      if (typeof console !== "undefined") {
+        console.warn("[lightrace] Error handling message:", err);
+      }
     }
   }
 
   // ── Message handlers ───────────────────────────────────────────────
 
   private onSystem(msg: SDKMessageLike): void {
-    // Capture model from init message for the root span name
-    if (msg.subtype === "init" && !this.agentRunId) {
-      // We'll use the model info when the first assistant message arrives
+    if (msg.subtype === "init") {
+      // Tools/model are nested in a `data` dict
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data = (msg as any).data as Record<string, unknown> | undefined;
+      const source = data ?? msg;
+      const tools = source.tools as string[] | undefined;
+      if (tools) this.initTools = [...tools];
+      const model = source.model as string | undefined;
+      if (model) this.initModel = model;
     }
   }
 
@@ -113,25 +130,40 @@ export class LightraceAgentHandler extends TracingMixin {
     // Start root agent span on first assistant message
     if (this.agentRunId === null) {
       this.agentRunId = generateId();
+      const input: Record<string, unknown> = { prompt: this.prompt };
+      if (this.initTools) input.tools = this.initTools;
+      if (this.initModel) input.model = this.initModel;
       this.registerRun(this.agentRunId, undefined, {
         type: "span",
         name: this.traceName ?? "claude-agent",
         startTime: new Date(),
-        input: this.prompt,
+        input,
       });
     }
-
-    this.turnCount++;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = msg as any;
     const betaMessage = raw.message;
-    const model: string | undefined = raw.model ?? betaMessage?.model;
-    const usage = betaMessage?.usage;
+    const messageId: string | undefined = raw.message_id ?? betaMessage?.id;
 
-    // Create a generation span for this turn
-    const genRunId = generateId();
-    this.registerRun(genRunId, this.agentRunId, {
+    // SDK yields multiple AssistantMessages per turn sharing the same
+    // message_id (e.g. thinking block, then tool_use block). Accumulate
+    // content blocks into a single generation span.
+    if (messageId && messageId === this.currentMessageId && this.currentGenRunId !== null) {
+      this.processContentBlocks(raw);
+      return;
+    }
+
+    // New turn — flush any pending generation from the previous turn.
+    this.flushGeneration();
+
+    const model: string | undefined = raw.model ?? betaMessage?.model;
+    this.currentMessageId = messageId ?? null;
+    this.currentGenRunId = generateId();
+    this.currentOutputBlocks = [];
+    this.currentUsage = null;
+
+    this.registerRun(this.currentGenRunId, this.agentRunId ?? undefined, {
       type: "generation",
       name: model ?? "claude",
       startTime: new Date(),
@@ -139,51 +171,78 @@ export class LightraceAgentHandler extends TracingMixin {
       model,
     });
 
-    // Extract content blocks
+    this.processContentBlocks(raw);
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private processContentBlocks(raw: any): void {
+    const betaMessage = raw.message;
     const content: unknown[] = betaMessage?.content ?? raw.content ?? [];
-    const outputBlocks: Record<string, unknown>[] = [];
+    const usage = betaMessage?.usage ?? raw.usage;
 
     for (const block of content) {
       const b = block as Record<string, unknown>;
       const blockType = b.type as string | undefined;
+      const hasText = "text" in b && !("id" in b);
+      const hasTool = "id" in b && "name" in b && "input" in b;
+      const hasThinking = "thinking" in b;
 
-      if (blockType === "text") {
-        outputBlocks.push({ type: "text", text: b.text ?? "" });
-      } else if (blockType === "tool_use") {
+      if (blockType === "text" || (!blockType && hasText)) {
+        this.currentOutputBlocks.push({ type: "text", text: b.text ?? "" });
+      } else if (blockType === "tool_use" || (!blockType && hasTool)) {
         const toolId = b.id as string;
         const toolName = b.name as string;
         const toolInput = b.input;
 
-        outputBlocks.push({
+        this.currentOutputBlocks.push({
           type: "tool_use",
           id: toolId,
           name: toolName,
-          input: jsonSerializable(toolInput),
+          input: toolInput,
         });
 
         // Start a tool span (ended when matching user message arrives)
         const toolRunId = generateId();
         this.toolRunIds.set(toolId, toolRunId);
-        this.registerRun(toolRunId, this.agentRunId, {
+        this.registerRun(toolRunId, this.agentRunId ?? undefined, {
           type: "tool",
           name: toolName,
           startTime: new Date(),
           input: toolInput,
         });
+      } else if (blockType === "thinking" || (!blockType && hasThinking)) {
+        this.currentOutputBlocks.push({ type: "thinking", thinking: b.thinking ?? "" });
       } else {
-        outputBlocks.push(jsonSerializable(b) as Record<string, unknown>);
+        this.currentOutputBlocks.push(jsonSerializable(b) as Record<string, unknown>);
       }
     }
 
-    // End the generation span (the LLM call itself is complete)
-    const normalizedUsage = usage ? normalizeUsage(usage as Record<string, unknown>) : null;
-    this.endRun(genRunId, outputBlocks, "DEFAULT", null, normalizedUsage ?? undefined);
+    // Keep the latest usage (last AssistantMessage in this turn wins)
+    if (usage) {
+      this.currentUsage = normalizeUsage(usage as Record<string, unknown>);
+    }
+  }
+
+  private flushGeneration(): void {
+    if (this.currentGenRunId === null) return;
+    const output: Record<string, unknown> = {
+      role: "assistant",
+      content: this.currentOutputBlocks,
+    };
+    this.endRun(this.currentGenRunId, output, "DEFAULT", null, this.currentUsage ?? undefined);
+    this.currentGenRunId = null;
+    this.currentMessageId = null;
+    this.currentOutputBlocks = [];
+    this.currentUsage = null;
   }
 
   private onUser(msg: SDKMessageLike): void {
+    this.flushGeneration();
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const raw = msg as any;
     const userMessage = raw.message;
+    const fallbackOutput = raw.tool_use_result as string | undefined;
 
     // User messages contain tool results as content blocks
     const content: unknown[] = Array.isArray(userMessage?.content)
@@ -195,17 +254,21 @@ export class LightraceAgentHandler extends TracingMixin {
     for (const block of content) {
       const b = block as Record<string, unknown>;
 
-      if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+      if ((b.type === "tool_result" || "tool_use_id" in b) && typeof b.tool_use_id === "string") {
         const toolUseId = b.tool_use_id as string;
         const toolRunId = this.toolRunIds.get(toolUseId);
         if (toolRunId) {
           this.toolRunIds.delete(toolUseId);
           const isError = Boolean(b.is_error);
-          const output = b.content;
+          let output = b.content ?? b.output;
+          // Use fallback from tool_use_result when block has no output
+          if (output === undefined && fallbackOutput !== undefined) {
+            output = fallbackOutput;
+          }
           if (isError) {
-            this.endRun(toolRunId, jsonSerializable(output), "ERROR", String(output));
+            this.endRun(toolRunId, output, "ERROR", String(output));
           } else {
-            this.endRun(toolRunId, jsonSerializable(output));
+            this.endRun(toolRunId, output);
           }
         }
       }
@@ -213,6 +276,8 @@ export class LightraceAgentHandler extends TracingMixin {
   }
 
   private onResult(msg: SDKMessageLike): void {
+    this.flushGeneration();
+
     // End any remaining tool spans
     for (const [, toolRunId] of this.toolRunIds) {
       this.endRun(toolRunId, null);
@@ -230,6 +295,7 @@ export class LightraceAgentHandler extends TracingMixin {
     if (raw.total_cost_usd !== undefined) output.total_cost_usd = raw.total_cost_usd;
     if (raw.duration_ms !== undefined) output.duration_ms = raw.duration_ms;
     if (raw.subtype !== undefined) output.subtype = raw.subtype;
+    if (raw.model_usage !== undefined) output.model_usage = jsonSerializable(raw.model_usage);
 
     const usage = raw.usage ? normalizeUsage(raw.usage as Record<string, unknown>) : null;
     const isError = Boolean(raw.is_error);
@@ -242,7 +308,6 @@ export class LightraceAgentHandler extends TracingMixin {
     }
 
     this.agentRunId = null;
-    this.turnCount = 0;
   }
 }
 
