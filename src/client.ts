@@ -1,5 +1,14 @@
 /**
  * Main Lightrace SDK client.
+ *
+ * Docker note: When the Lightrace backend runs in Docker, set `devServerHost`
+ * (or env var `LIGHTRACE_DEV_SERVER_HOST`) so the backend container can reach
+ * the SDK's dev server for tool re-invocation:
+ *
+ * ```ts
+ * const lt = new Lightrace({ ..., devServerHost: "host.docker.internal" });
+ * // or: LIGHTRACE_DEV_SERVER_HOST=host.docker.internal node app.js
+ * ```
  */
 import { LightraceOtelExporter } from "./otel-exporter.js";
 import { AS_ROOT, TRACE_NAME } from "./otel-exporter.js";
