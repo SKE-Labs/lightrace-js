@@ -9,6 +9,7 @@ import {
   _setClientDefaults,
   _getTraceContext,
   _getToolRegistry,
+  _setOnToolRegistered,
 } from "./trace.js";
 import { DevServer } from "./dev-server.js";
 import { Observation } from "./observation.js";
@@ -34,6 +35,12 @@ export interface LightraceOptions {
   devServer?: boolean;
   /** Port for the dev server (0 = auto-discover free port). Default: 0. */
   devServerPort?: number;
+  /**
+   * Host to use in the callback URL registered with the backend.
+   * Default: "127.0.0.1". Set to "host.docker.internal" when backend runs in Docker.
+   * Also configurable via LIGHTRACE_DEV_SERVER_HOST env var.
+   */
+  devServerHost?: string;
 }
 
 export class Lightrace {
@@ -47,6 +54,8 @@ export class Lightrace {
   private secretKey: string;
   private devServerEnabled: boolean;
   private devServerPort: number;
+  private devServerHost: string;
+  private registrationTimer: ReturnType<typeof setTimeout> | null = null;
   readonly userId: string | undefined;
   readonly sessionId: string | undefined;
 
@@ -62,6 +71,8 @@ export class Lightrace {
     this.sessionId = options.sessionId;
     this.devServerEnabled = options.devServer !== false;
     this.devServerPort = options.devServerPort ?? 0;
+    this.devServerHost =
+      options.devServerHost ?? process.env.LIGHTRACE_DEV_SERVER_HOST ?? "127.0.0.1";
 
     if (!this.enabled) return;
 
@@ -100,6 +111,7 @@ export class Lightrace {
     this._devServer = new DevServer({
       port: this.devServerPort,
       publicKey: this.publicKey,
+      callbackHost: this.devServerHost,
     });
 
     this._devServer
@@ -107,6 +119,15 @@ export class Lightrace {
       .then((port) => {
         console.log(`[lightrace] Dev server listening on http://127.0.0.1:${port}`);
         this.registerToolsHttp();
+
+        // Re-register when new tools are added after init (debounced)
+        _setOnToolRegistered(() => {
+          if (this.registrationTimer) clearTimeout(this.registrationTimer);
+          this.registrationTimer = setTimeout(() => {
+            this.registrationTimer = null;
+            this.registerToolsHttp();
+          }, 200);
+        });
       })
       .catch((err) => {
         console.error("[lightrace] Failed to start dev server:", err);
@@ -127,21 +148,41 @@ export class Lightrace {
     }));
 
     const auth = Buffer.from(`${this.publicKey}:${this.secretKey}`).toString("base64");
+    const maxRetries = 3;
 
-    fetch(`${this.host}/api/public/tools/register`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${auth}`,
-      },
-      body: JSON.stringify({ callbackUrl, tools }),
-    })
-      .then((res) => {
-        if (!res.ok) console.warn(`[lightrace] Tool registration returned ${res.status}`);
-      })
-      .catch((err) => {
-        console.error("[lightrace] Failed to register tools:", err.message);
-      });
+    const attempt = async (n: number): Promise<void> => {
+      try {
+        const res = await fetch(`${this.host}/api/public/tools/register`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Basic ${auth}`,
+          },
+          body: JSON.stringify({ callbackUrl, tools }),
+        });
+        if (res.ok) {
+          console.log(
+            `[lightrace] Registered ${tools.length} tool(s): ${tools.map((t) => t.name).join(", ")}`,
+          );
+          return;
+        }
+        console.warn(
+          `[lightrace] Tool registration returned ${res.status} (attempt ${n + 1}/${maxRetries})`,
+        );
+      } catch (err) {
+        console.warn(
+          `[lightrace] Tool registration failed (attempt ${n + 1}/${maxRetries}):`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      if (n < maxRetries - 1) {
+        await new Promise((r) => setTimeout(r, 1000 * 2 ** n));
+        return attempt(n + 1);
+      }
+      console.error("[lightrace] Tool registration failed after all retries");
+    };
+
+    attempt(0);
   }
 
   // -- Flush / shutdown --------------------------------------------------------
@@ -151,6 +192,11 @@ export class Lightrace {
   }
 
   async shutdown(): Promise<void> {
+    _setOnToolRegistered(null);
+    if (this.registrationTimer) {
+      clearTimeout(this.registrationTimer);
+      this.registrationTimer = null;
+    }
     if (this._devServer) {
       await this._devServer.stop();
       this._devServer = null;

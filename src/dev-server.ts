@@ -23,6 +23,8 @@ export interface DevServerOptions {
   port?: number;
   /** Public key for request authentication. */
   publicKey?: string;
+  /** Host to use in the callback URL registered with the backend. Default: "127.0.0.1". */
+  callbackHost?: string;
 }
 
 export class DevServer {
@@ -30,10 +32,12 @@ export class DevServer {
   private publicKey: string;
   private assignedPort: number | null = null;
   private requestedPort: number;
+  private callbackHost: string;
 
   constructor(options: DevServerOptions = {}) {
     this.requestedPort = options.port ?? 0;
     this.publicKey = options.publicKey ?? "";
+    this.callbackHost = options.callbackHost ?? "127.0.0.1";
   }
 
   async start(): Promise<number> {
@@ -119,6 +123,6 @@ export class DevServer {
 
   getCallbackUrl(): string | null {
     if (!this.assignedPort) return null;
-    return `http://127.0.0.1:${this.assignedPort}`;
+    return `http://${this.callbackHost}:${this.assignedPort}`;
   }
 }

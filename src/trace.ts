@@ -19,6 +19,9 @@ let _clientDefaults: { userId?: string; sessionId?: string } = {};
 /** Global tool registry for invocable tools. */
 const _toolRegistry = new Map<string, ToolRegistryEntry>();
 
+/** Callback fired when a new tool is registered. */
+let _onToolRegistered: ((name: string) => void) | null = null;
+
 export function _setOtelExporter(exporter: LightraceOtelExporter | null): void {
   _otelExporter = exporter;
 }
@@ -44,6 +47,10 @@ export function _getTraceContext(): { traceId: string; observationId: string | n
 
 export function _getToolRegistry(): Map<string, ToolRegistryEntry> {
   return _toolRegistry;
+}
+
+export function _setOnToolRegistered(callback: ((name: string) => void) | null): void {
+  _onToolRegistered = callback;
 }
 
 /** Helper to set span attributes for a root trace or child observation. */
@@ -135,6 +142,7 @@ export function trace<T extends (...args: any[]) => any>(
       inputSchema,
       description: null,
     });
+    _onToolRegistered?.(obsName);
   }
 
   const wrapped = ((...args: unknown[]) => {
