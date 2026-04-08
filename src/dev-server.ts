@@ -93,7 +93,14 @@ export class DevServer {
     return new Promise((resolve, reject) => {
       try {
         const server = serve(
-          { fetch: app.fetch, port: this.requestedPort, hostname: "127.0.0.1" },
+          {
+            fetch: app.fetch,
+            port: this.requestedPort,
+            hostname:
+              this.callbackHost === "127.0.0.1" || this.callbackHost === "localhost"
+                ? "127.0.0.1"
+                : "0.0.0.0",
+          },
           (info) => {
             this.assignedPort = info.port;
             this.server = server as Server;
