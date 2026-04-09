@@ -102,7 +102,7 @@
     ]
   },
   "packageManager": "yarn@1.22.22",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/SKE-Labs/lightrace-js.git"
