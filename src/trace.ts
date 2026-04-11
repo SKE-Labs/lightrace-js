@@ -9,6 +9,7 @@ import * as attrs from "./otel-exporter.js";
 import type { TraceOptions, ToolRegistryEntry } from "./types.js";
 import { OBSERVATION_TYPE_ENUM } from "./types.js";
 import { jsonSerializable, zodToJsonSchema } from "./utils.js";
+import { captureContext } from "./context.js";
 
 /** Global OTel exporter reference (set by Client). */
 let _otelExporter: LightraceOtelExporter | null = null;
@@ -90,7 +91,20 @@ function setSpanAttributes(
     );
     span.setAttribute(attrs.OBSERVATION_INPUT, attrs.safeJson(opts.input));
     span.setAttribute(attrs.OBSERVATION_OUTPUT, attrs.safeJson(opts.output));
-    if (opts.metadata) span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(opts.metadata));
+    // Auto-capture context for tool observations
+    if (opts.obsType === "tool") {
+      const ctx = captureContext();
+      if (Object.keys(ctx).length > 0) {
+        const meta = opts.metadata
+          ? { ...opts.metadata, __lightrace_context: ctx }
+          : { __lightrace_context: ctx };
+        span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(meta));
+      } else if (opts.metadata) {
+        span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(opts.metadata));
+      }
+    } else if (opts.metadata) {
+      span.setAttribute(attrs.OBSERVATION_METADATA, attrs.safeJson(opts.metadata));
+    }
     if (opts.model) span.setAttribute(attrs.OBSERVATION_MODEL, opts.model);
     span.setAttribute(attrs.OBSERVATION_LEVEL, opts.level);
     if (opts.statusMessage) span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, opts.statusMessage);

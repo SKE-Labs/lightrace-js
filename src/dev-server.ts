@@ -13,6 +13,7 @@ import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { _getToolRegistry } from "./trace.js";
 import { jsonSerializable } from "./utils.js";
+import { captureContext, restoreContext } from "./context.js";
 
 function apiResponse(c: Context, code: number, message: string, response: unknown = null) {
   return c.json({ code, message, response }, code as ContentfulStatusCode);
@@ -61,12 +62,22 @@ export class DevServer {
         return apiResponse(c, 400, "Invalid JSON body");
       }
 
-      const { tool, input } = body as { tool: string; input: unknown };
+      const { tool, input, context } = body as {
+        tool: string;
+        input: unknown;
+        context?: Record<string, unknown>;
+      };
 
       const registry = _getToolRegistry();
       const entry = registry.get(tool);
       if (!entry) {
         return apiResponse(c, 404, `Tool not found: ${tool}`);
+      }
+
+      // Restore captured context, saving old values to reset after invocation
+      const savedContext = context ? captureContext() : null;
+      if (context) {
+        restoreContext(context);
       }
 
       const start = performance.now();
@@ -87,6 +98,10 @@ export class DevServer {
           error: err instanceof Error ? err.message : String(err),
           durationMs,
         });
+      } finally {
+        if (savedContext) {
+          restoreContext(savedContext);
+        }
       }
     });
 
