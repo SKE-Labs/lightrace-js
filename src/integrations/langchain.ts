@@ -19,11 +19,13 @@ import type { Serialized } from "@langchain/core/load/serializable";
 import type { LLMResult } from "@langchain/core/outputs";
 import type { BaseMessage } from "@langchain/core/messages";
 import type { DocumentInterface } from "@langchain/core/documents";
-import type { Span } from "@opentelemetry/api";
+import { type Span, trace as otelTrace, TraceFlags, ROOT_CONTEXT } from "@opentelemetry/api";
 import { generateId, jsonSerializable } from "../utils.js";
 import type { LightraceOtelExporter } from "../otel-exporter.js";
 import * as attrs from "../otel-exporter.js";
 import { Lightrace } from "../client.js";
+import { restoreContext } from "../context.js";
+import type { ForkOptions } from "../dev-server.js";
 
 interface RunInfo {
   observationId: string;
@@ -49,6 +51,10 @@ export interface LightraceCallbackHandlerOptions {
   metadata?: Record<string, unknown>;
   /** Provide a Lightrace client instance. If omitted, uses Lightrace.getInstance(). */
   client?: Lightrace;
+  /** LangGraph configurable dict (thread_id, checkpoint_id, etc.) for context capture. */
+  configurable?: Record<string, unknown>;
+  /** Force all spans onto a specific trace ID (used for fork replay). */
+  traceId?: string;
 }
 
 export class LightraceCallbackHandler extends BaseCallbackHandler {
@@ -66,6 +72,8 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
   private sessionId?: string;
   private traceName?: string;
   private rootMetadata?: Record<string, unknown>;
+  private configurable?: Record<string, unknown>;
+  private forcedTraceId?: string;
 
   // OTel exporter
   private otelExporter: LightraceOtelExporter | null = null;
@@ -82,6 +90,8 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     this.sessionId = opts?.sessionId;
     this.traceName = opts?.traceName;
     this.rootMetadata = opts?.metadata;
+    this.configurable = opts?.configurable;
+    this.forcedTraceId = opts?.traceId;
 
     const client = opts?.client ?? Lightrace.getInstance();
     this.otelExporter = client?.getOtelExporter() ?? null;
@@ -226,9 +236,24 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
 
       // Create root span representing the trace
       if (tracer) {
-        this.rootSpan = tracer.startSpan(this.traceName ?? info.name, {
-          startTime: info.startTime,
-        });
+        // When forcedTraceId is set (fork replay), create a remote parent
+        // context so the root span inherits the desired trace ID.
+        let rootCtx = undefined;
+        if (this.forcedTraceId) {
+          const remoteSpan = otelTrace.wrapSpanContext({
+            traceId: this.forcedTraceId,
+            spanId: generateId().slice(0, 16),
+            traceFlags: TraceFlags.SAMPLED,
+            isRemote: true,
+          });
+          rootCtx = otelTrace.setSpan(ROOT_CONTEXT, remoteSpan);
+        }
+
+        this.rootSpan = tracer.startSpan(
+          this.traceName ?? info.name,
+          { startTime: info.startTime },
+          rootCtx,
+        );
         this.rootSpan.setAttribute(attrs.AS_ROOT, "true");
         this.rootSpan.setAttribute(attrs.TRACE_NAME, this.traceName ?? info.name);
         this.rootSpan.setAttribute(attrs.TRACE_INPUT, attrs.safeJson(jsonSerializable(info.input)));
@@ -703,4 +728,112 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
   get traceId(): string | null {
     return this._traceId;
   }
+}
+
+// ── LangGraph fork / replay ──────────────────────────────────────────────
+
+/**
+ * Fork a LangGraph thread at a tool result and continue execution.
+ *
+ * Uses the graph's own checkpointer to walk state history, find the
+ * post-tools checkpoint, replace the ToolMessage, and resume via
+ * `invoke`.  When `forkedTraceId` is set, a {@link LightraceCallbackHandler}
+ * streams OTel observations to the forked trace in real-time.
+ *
+ * This is the LangChain/LangGraph implementation of the fork feature.
+ */
+export async function forkGraph(opts: ForkOptions): Promise<void> {
+  const { graph, threadId, toolCallId, toolName, modifiedContent, context, forkedTraceId } = opts;
+
+  // Lazy-import ToolMessage to avoid requiring @langchain/core at module load
+  const { ToolMessage } = await import("@langchain/core/messages");
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const g = graph as any;
+  const config = { configurable: { thread_id: threadId } };
+
+  const matches = (msg: unknown): boolean => {
+    if (!(msg instanceof ToolMessage)) return false;
+    if (toolCallId) return msg.tool_call_id === toolCallId;
+    return msg.name === toolName;
+  };
+
+  // 1. Find the post-tools checkpoint (oldest state with the target ToolMessage).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let targetState: any = null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let targetToolMsg: any = null;
+
+  for await (const state of g.getStateHistory(config)) {
+    const messages: unknown[] = state.values?.messages ?? [];
+    const found = messages.find((m) => matches(m));
+    if (found) {
+      targetState = state;
+      targetToolMsg = found;
+    } else if (targetState) {
+      break; // Crossed the boundary
+    }
+  }
+
+  if (!targetState || !targetToolMsg) {
+    throw new Error(`No checkpoint found with tool '${toolName}' in thread '${threadId}'`);
+  }
+
+  // 2. Replace the ToolMessage — same message ID triggers replacement
+  //    via the add_messages reducer.
+  const replacement = new ToolMessage({
+    content: modifiedContent,
+    tool_call_id: targetToolMsg.tool_call_id,
+    name: toolName,
+    id: targetToolMsg.id,
+  });
+
+  // 3. Fork from the target checkpoint using the ORIGINAL config.
+  const forkConfig = await g.updateState(targetState.config, { messages: [replacement] });
+
+  // 4. Merge app-level configurable keys (user_id, spawn_id, etc.)
+  const originalConfigurable = targetState.config?.configurable ?? {};
+  for (const [k, v] of Object.entries(originalConfigurable)) {
+    if (!["thread_id", "checkpoint_id", "checkpoint_ns"].includes(k)) {
+      forkConfig.configurable[k] ??= v;
+    }
+  }
+  if (context) {
+    for (const k of ["user_id", "spawn_id"]) {
+      if (k in context) forkConfig.configurable[k] = context[k];
+    }
+  }
+
+  // 5. Restore context (user_id, etc.) before graph execution
+  if (context) {
+    restoreContext(context);
+  }
+
+  // 6. Attach a LightraceCallbackHandler so the continuation produces
+  //    real OTel observations on the forked trace (full trace tree).
+  const callbacks: unknown[] = [];
+  if (forkedTraceId) {
+    try {
+      const client = Lightrace.getInstance();
+      if (client) {
+        callbacks.push(
+          new LightraceCallbackHandler({
+            client,
+            traceId: forkedTraceId,
+            traceName: `${toolName} (fork)`,
+            userId: context?.user_id as string | undefined,
+            sessionId: threadId,
+            configurable: forkConfig.configurable,
+          }),
+        );
+      }
+    } catch {
+      console.warn("[lightrace] Could not create fork callback handler");
+    }
+  }
+
+  const invokeConfig = callbacks.length > 0 ? { ...forkConfig, callbacks } : forkConfig;
+
+  // 7. Continue execution from the fork point.
+  await g.invoke(null, invokeConfig);
 }

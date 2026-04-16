@@ -11,9 +11,39 @@ import { bodyLimit } from "hono/body-limit";
 import { serve } from "@hono/node-server";
 import type { Context } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { _getToolRegistry } from "./trace.js";
+import { _getToolRegistry, _getReplayRegistry } from "./trace.js";
 import { jsonSerializable } from "./utils.js";
 import { captureContext, restoreContext } from "./context.js";
+
+export interface ForkOptions {
+  graph: unknown;
+  threadId: string;
+  toolCallId?: string;
+  toolName: string;
+  modifiedContent: string;
+  context?: Record<string, unknown>;
+  forkedTraceId?: string;
+}
+
+type ForkFn = (opts: ForkOptions) => Promise<void>;
+
+function resolveForkFn(handler: unknown): ForkFn | null {
+  const h = handler as Record<string, unknown>;
+
+  // LangChain / LangGraph — compiled graph with checkpoint support
+  if (typeof h.invoke === "function" && typeof h.updateState === "function") {
+    // Lazy import to avoid pulling in @langchain/core when not needed
+    return async (opts) => {
+      const { forkGraph } = await import("./integrations/langchain.js");
+      return forkGraph(opts);
+    };
+  }
+
+  // TODO: CrewAI fork support
+  // TODO: Claude Agent SDK fork support
+
+  return null;
+}
 
 function apiResponse(c: Context, code: number, message: string, response: unknown = null) {
   return c.json({ code, message, response }, code as ContentfulStatusCode);
@@ -49,6 +79,7 @@ export class DevServer {
 
     app.use("*", cors());
     app.use("/invoke", bodyLimit({ maxSize: 1024 * 1024 }));
+    app.use("/replay", bodyLimit({ maxSize: 1024 * 1024 }));
 
     app.get("/health", (c) => apiResponse(c, 200, "OK", { status: "ok" }));
 
@@ -103,6 +134,76 @@ export class DevServer {
           restoreContext(savedContext);
         }
       }
+    });
+
+    app.post("/replay", async (c) => {
+      if (publicKey && c.req.header("Authorization") !== `Bearer ${publicKey}`) {
+        return apiResponse(c, 401, "Unauthorized");
+      }
+
+      const body = await c.req.json().catch(() => null);
+      if (!body || typeof body !== "object") {
+        return apiResponse(c, 400, "Invalid JSON body");
+      }
+
+      const {
+        thread_id: threadId,
+        tool_call_id: toolCallId,
+        tool_name: toolName,
+        modified_content: modifiedContent,
+        context,
+        forked_trace_id: forkedTraceId,
+      } = body as {
+        thread_id?: string;
+        tool_call_id?: string;
+        tool_name?: string;
+        modified_content?: string;
+        context?: Record<string, unknown>;
+        forked_trace_id?: string;
+      };
+
+      if (!threadId || !toolName || modifiedContent == null) {
+        return apiResponse(
+          c,
+          422,
+          "Missing required fields: thread_id, tool_name, modified_content",
+        );
+      }
+
+      const handler = _getReplayRegistry().get("default");
+      if (!handler) {
+        return apiResponse(
+          c,
+          400,
+          "No graph registered for replay. Call registerGraph() to enable fork/replay.",
+        );
+      }
+
+      // Detect framework and resolve fork function
+      const forkFn = resolveForkFn(handler);
+      if (!forkFn) {
+        return apiResponse(
+          c,
+          400,
+          "Registered handler is not a supported graph type. Currently supported: LangChain/LangGraph.",
+        );
+      }
+
+      // Fire-and-forget: start fork in background, return immediately
+      const replayContext = context;
+      forkFn({
+        graph: handler,
+        threadId,
+        toolCallId,
+        toolName,
+        modifiedContent,
+        context: replayContext,
+        forkedTraceId,
+      }).catch((err: unknown) => {
+        console.error("[lightrace] Fork replay failed:", err instanceof Error ? err.message : err);
+      });
+
+      return apiResponse(c, 200, "OK", { status: "started" });
     });
 
     return new Promise((resolve, reject) => {

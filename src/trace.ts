@@ -54,6 +54,17 @@ export function _setOnToolRegistered(callback: ((name: string) => void) | null):
   _onToolRegistered = callback;
 }
 
+/** Global replay handler registry for fork/replay from the dashboard. */
+const _replayRegistry = new Map<string, unknown>();
+
+export function _getReplayRegistry(): Map<string, unknown> {
+  return _replayRegistry;
+}
+
+export function _setReplayHandler(name: string, handler: unknown): void {
+  _replayRegistry.set(name, handler);
+}
+
 /** Helper to set span attributes for a root trace or child observation. */
 function setSpanAttributes(
   span: Span,

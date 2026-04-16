@@ -5,7 +5,7 @@ import {
   InMemorySpanExporter,
 } from "@opentelemetry/sdk-trace-base";
 import { DevServer } from "../src/dev-server.js";
-import { _setOtelExporter, _getToolRegistry } from "../src/trace.js";
+import { _setOtelExporter, _getToolRegistry, _getReplayRegistry } from "../src/trace.js";
 import { trace } from "../src/trace.js";
 
 let memoryExporter: InMemorySpanExporter;
@@ -24,6 +24,7 @@ beforeEach(() => {
 afterEach(() => {
   _setOtelExporter(null);
   _getToolRegistry().clear();
+  _getReplayRegistry().clear();
   provider.shutdown();
 });
 
@@ -212,5 +213,65 @@ describe("DevServer", () => {
     expect(body.code).toBe(200);
     expect(body.response.output.done).toBe(true);
     expect(body.response.durationMs).toBeGreaterThanOrEqual(10);
+  });
+
+  // -- /replay endpoint -------------------------------------------------------
+
+  it("returns 400 when no graph is registered for replay", async () => {
+    server = new DevServer();
+    const port = await server.start();
+
+    const res = await fetch(`http://127.0.0.1:${port}/replay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        thread_id: "t1",
+        tool_name: "search",
+        modified_content: "new result",
+      }),
+    });
+
+    const body = await res.json();
+    expect(res.status).toBe(400);
+    expect(body.message).toContain("No graph registered");
+  });
+
+  it("returns 422 when required fields are missing", async () => {
+    server = new DevServer();
+    const port = await server.start();
+
+    const res = await fetch(`http://127.0.0.1:${port}/replay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: "t1" }),
+    });
+
+    const body = await res.json();
+    expect(res.status).toBe(422);
+  });
+
+  it("returns 400 for unsupported handler type", async () => {
+    // Register a plain object (not a LangGraph)
+    const { _setReplayHandler } = await import("../src/trace.js");
+    _setReplayHandler("default", { notAGraph: true });
+
+    server = new DevServer();
+    const port = await server.start();
+
+    const res = await fetch(`http://127.0.0.1:${port}/replay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        thread_id: "t1",
+        tool_name: "search",
+        modified_content: "result",
+      }),
+    });
+
+    const body = await res.json();
+    expect(res.status).toBe(400);
+    expect(body.message).toContain("not a supported graph type");
+
+    _setReplayHandler("default", undefined as unknown);
   });
 });

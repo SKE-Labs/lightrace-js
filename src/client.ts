@@ -19,6 +19,8 @@ import {
   _getTraceContext,
   _getToolRegistry,
   _setOnToolRegistered,
+  _getReplayRegistry,
+  _setReplayHandler,
 } from "./trace.js";
 import { DevServer } from "./dev-server.js";
 import { Observation } from "./observation.js";
@@ -156,18 +158,28 @@ export class Lightrace {
       description: entry.description ?? null,
     }));
 
+    // Include replay capabilities if a graph is registered
+    const replayHandler = _getReplayRegistry().get("default");
+    const hasGraph =
+      replayHandler != null &&
+      typeof (replayHandler as Record<string, unknown>).updateState === "function";
+    const capabilities = replayHandler ? { replay: true, graph: hasGraph } : undefined;
+
     const auth = Buffer.from(`${this.publicKey}:${this.secretKey}`).toString("base64");
     const maxRetries = 3;
 
     const attempt = async (n: number): Promise<void> => {
       try {
+        const payload: Record<string, unknown> = { callbackUrl, tools };
+        if (capabilities) payload.capabilities = capabilities;
+
         const res = await fetch(`${this.host}/api/public/tools/register`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: `Basic ${auth}`,
           },
-          body: JSON.stringify({ callbackUrl, tools }),
+          body: JSON.stringify(payload),
         });
         if (res.ok) {
           console.log(
@@ -192,6 +204,19 @@ export class Lightrace {
     };
 
     attempt(0);
+  }
+
+  /**
+   * Register a compiled LangGraph for fork/replay from the dashboard.
+   *
+   * The graph must have a persistent checkpointer so the SDK can resume
+   * from any captured checkpoint via `updateState` + `invoke`.
+   */
+  registerGraph(graph: unknown): void {
+    _setReplayHandler("default", graph);
+    if (this.enabled) {
+      this.registerToolsHttp();
+    }
   }
 
   // -- Flush / shutdown --------------------------------------------------------
