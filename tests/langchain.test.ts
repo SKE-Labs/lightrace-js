@@ -827,6 +827,44 @@ describe("LightraceCallbackHandler", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("anchors orphan child callbacks to the root trace", async () => {
+    // Children whose parent_run_id was never registered (e.g. lost across
+    // a langgraph __pregel_push task boundary) must still anchor to the
+    // root's trace, not spawn a new one.
+    const rootRunId = "agent-root";
+    const unknownParentRunId = "ghost-parent";
+    const toolRunId = "tool-child";
+
+    await handler.handleChainStart(serializedWithName("agent-run"), { q: "hi" }, rootRunId);
+
+    await handler.handleToolStart(
+      {
+        lc: 1,
+        type: "not_implemented",
+        id: ["langchain", "tools", "read_file"],
+        name: "read_file",
+      } as unknown as Serialized,
+      "{}",
+      toolRunId,
+      unknownParentRunId,
+    );
+    await handler.handleToolEnd("contents", toolRunId);
+    await handler.handleChainEnd({ result: "ok" }, rootRunId);
+
+    const spans = memoryExporter.getFinishedSpans();
+    const traceIds = new Set(spans.map((s) => s.spanContext().traceId));
+    expect(traceIds.size).toBe(1);
+
+    const traceRootSpan = findRootSpan(spans)!; // AS_ROOT="true"
+    const toolSpan = spans.find((s) => s.name === "read_file")!;
+    expect(traceRootSpan).toBeTruthy();
+    expect(toolSpan).toBeTruthy();
+    expect(toolSpan.parentSpanContext?.spanId).toBe(traceRootSpan.spanContext().spanId);
+
+    const asRootCount = spans.filter((s) => s.attributes[attrs.AS_ROOT] === "true").length;
+    expect(asRootCount).toBe(1);
+  });
+
   it("continues working after a callback error", async () => {
     // Suppress console.warn during this test
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});

@@ -19,7 +19,13 @@ import type { Serialized } from "@langchain/core/load/serializable";
 import type { LLMResult } from "@langchain/core/outputs";
 import type { BaseMessage } from "@langchain/core/messages";
 import type { DocumentInterface } from "@langchain/core/documents";
-import { type Span, trace as otelTrace, TraceFlags, ROOT_CONTEXT } from "@opentelemetry/api";
+import {
+  type Span,
+  context as otelContext,
+  trace as otelTrace,
+  TraceFlags,
+  ROOT_CONTEXT,
+} from "@opentelemetry/api";
 import { generateId, jsonSerializable } from "../utils.js";
 import type { LightraceOtelExporter } from "../otel-exporter.js";
 import * as attrs from "../otel-exporter.js";
@@ -267,10 +273,25 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
 
     const observationId = generateId();
 
-    // Create an OTel span for this observation
+    // When async dispatch (e.g. langgraph __pregel_push on a sync handler)
+    // leaves context.active() empty, anchor every observation span to the
+    // root span — otherwise the backend sees a parentless span and splits
+    // one run across many traces.
     let span: Span;
     if (tracer) {
-      span = tracer.startSpan(info.name, { startTime: info.startTime });
+      let parentCtx = otelContext.active();
+      let parented = false;
+      if (parentRunId) {
+        const parentRun = this.runs.get(parentRunId);
+        if (parentRun?.span) {
+          parentCtx = otelTrace.setSpan(parentCtx, parentRun.span);
+          parented = true;
+        }
+      }
+      if (!parented && otelTrace.getSpan(parentCtx) === undefined && this.rootSpan) {
+        parentCtx = otelTrace.setSpan(parentCtx, this.rootSpan);
+      }
+      span = tracer.startSpan(info.name, { startTime: info.startTime }, parentCtx);
     } else {
       // Dummy span if no tracer -- will be a no-op
       span = {
