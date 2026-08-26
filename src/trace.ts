@@ -138,7 +138,9 @@ function setSpanAttributes(
     if (opts.level === "ERROR" && opts.errorStacktrace) {
       try {
         (span as any).recordException?.(new Error(opts.statusMessage || "Error"));
-      } catch {}
+      } catch {
+        void 0;
+      }
     }
   }
 }

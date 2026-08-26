@@ -233,7 +233,9 @@ export class TracingMixin {
     if (level === "ERROR" && errorStacktrace) {
       try {
         (span as any).recordException?.(new Error(statusMessage || "Error"));
-      } catch {}
+      } catch {
+        void 0;
+      }
     }
 
     span.end();

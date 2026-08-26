@@ -136,7 +136,9 @@ export class Observation {
     if (this.level === "ERROR" && this.errorStacktrace) {
       try {
         (span as any).recordException?.(new Error(this.statusMessage || "Error"));
-      } catch {}
+      } catch {
+        void 0;
+      }
     }
 
     span.end();
