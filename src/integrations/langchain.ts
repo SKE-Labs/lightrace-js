@@ -144,6 +144,9 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     level: string,
     statusMessage: string | null,
     extra?: Record<string, unknown>,
+    errorType?: string | null,
+    errorStacktrace?: string | null,
+    errorHandled?: boolean | null,
   ): void {
     const obsTypeMap: Record<string, string> = {
       span: "SPAN",
@@ -169,6 +172,17 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     if (statusMessage) {
       span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, statusMessage);
     }
+    if (errorType) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_TYPE, errorType);
+    }
+    if (errorStacktrace) {
+      const truncated =
+        errorStacktrace.length > 8000 ? errorStacktrace.slice(0, 8000) : errorStacktrace;
+      span.setAttribute(attrs.OBSERVATION_ERROR_STACKTRACE, truncated);
+    }
+    if (errorHandled !== undefined && errorHandled !== null) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_HANDLED, String(errorHandled).toLowerCase());
+    }
     if (run.modelParameters && Object.keys(run.modelParameters).length > 0) {
       span.setAttribute(attrs.OBSERVATION_MODEL_PARAMETERS, attrs.safeJson(run.modelParameters));
     }
@@ -181,6 +195,16 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
       if (extra.totalTokens !== undefined) usageDetails.totalTokens = extra.totalTokens;
       if (Object.keys(usageDetails).length > 0) {
         span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(usageDetails));
+      }
+    }
+
+    if (level === "ERROR" && errorStacktrace) {
+      try {
+        (span as unknown as { recordException?: (e: Error) => void }).recordException?.(
+          new Error(statusMessage || "Error"),
+        );
+      } catch {
+        void 0;
       }
     }
 
@@ -327,11 +351,23 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
     level = "DEFAULT",
     statusMessage: string | null = null,
     extra?: Record<string, unknown>,
+    errorType?: string | null,
+    errorStacktrace?: string | null,
+    errorHandled?: boolean | null,
   ): void {
     const run = this.runs.get(runId);
     if (!run) return;
 
-    this.endObservationSpan(run, output, level, statusMessage, extra);
+    this.endObservationSpan(
+      run,
+      output,
+      level,
+      statusMessage,
+      extra,
+      errorType,
+      errorStacktrace,
+      errorHandled,
+    );
 
     // If this is the root run completing, end the root span and reset
     if (runId === this.rootRunId) {
