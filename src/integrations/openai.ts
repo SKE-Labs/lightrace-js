@@ -80,7 +80,16 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
 
           return result;
         } catch (err) {
-          this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+          this.endRun(
+            runId,
+            null,
+            "ERROR",
+            err instanceof Error ? err.message : String(err),
+            undefined,
+            err instanceof Error ? err.name : "Error",
+            err instanceof Error ? (err.stack ?? String(err)) : String(err),
+            false,
+          );
           throw err;
         }
       };
@@ -114,7 +123,16 @@ export class LightraceOpenAIInstrumentor extends TracingMixin {
 
           return result;
         } catch (err) {
-          this.endRun(runId, null, "ERROR", err instanceof Error ? err.message : String(err));
+          this.endRun(
+            runId,
+            null,
+            "ERROR",
+            err instanceof Error ? err.message : String(err),
+            undefined,
+            err instanceof Error ? err.name : "Error",
+            err instanceof Error ? (err.stack ?? String(err)) : String(err),
+            false,
+          );
           throw err;
         }
       };

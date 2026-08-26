@@ -177,6 +177,9 @@ export class TracingMixin {
     level: string,
     statusMessage: string | null,
     extra?: Record<string, unknown>,
+    errorType?: string | null,
+    errorStacktrace?: string | null,
+    errorHandled?: boolean | null,
   ): void {
     const obsTypeMap: Record<string, string> = {
       span: "SPAN",
@@ -202,6 +205,17 @@ export class TracingMixin {
     if (statusMessage) {
       span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, statusMessage);
     }
+    if (errorType) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_TYPE, errorType);
+    }
+    if (errorStacktrace) {
+      const truncated =
+        errorStacktrace.length > 8000 ? errorStacktrace.slice(0, 8000) : errorStacktrace;
+      span.setAttribute(attrs.OBSERVATION_ERROR_STACKTRACE, truncated);
+    }
+    if (errorHandled !== undefined && errorHandled !== null) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_HANDLED, String(errorHandled).toLowerCase());
+    }
     if (run.modelParameters && Object.keys(run.modelParameters).length > 0) {
       span.setAttribute(attrs.OBSERVATION_MODEL_PARAMETERS, attrs.safeJson(run.modelParameters));
     }
@@ -216,6 +230,12 @@ export class TracingMixin {
       }
     }
 
+    if (level === "ERROR" && errorStacktrace) {
+      try {
+        (span as any).recordException?.(new Error(statusMessage || "Error"));
+      } catch {}
+    }
+
     span.end();
   }
 
@@ -225,11 +245,23 @@ export class TracingMixin {
     level = "DEFAULT",
     statusMessage: string | null = null,
     extra?: Record<string, unknown>,
+    errorType?: string | null,
+    errorStacktrace?: string | null,
+    errorHandled?: boolean | null,
   ): void {
     const run = this.runs.get(runId);
     if (!run) return;
 
-    this.endObservationSpan(run, output, level, statusMessage, extra);
+    this.endObservationSpan(
+      run,
+      output,
+      level,
+      statusMessage,
+      extra,
+      errorType,
+      errorStacktrace,
+      errorHandled,
+    );
 
     if (runId === this.rootRunId) {
       if (this.rootSpan) {

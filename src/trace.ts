@@ -85,6 +85,9 @@ function setSpanAttributes(
       completionTokens?: number;
       totalTokens?: number;
     } | null;
+    errorType?: string | null;
+    errorStacktrace?: string | null;
+    errorHandled?: boolean | null;
   },
 ): void {
   if (opts.isRoot) {
@@ -119,8 +122,23 @@ function setSpanAttributes(
     if (opts.model) span.setAttribute(attrs.OBSERVATION_MODEL, opts.model);
     span.setAttribute(attrs.OBSERVATION_LEVEL, opts.level);
     if (opts.statusMessage) span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, opts.statusMessage);
+    if (opts.errorType) span.setAttribute(attrs.OBSERVATION_ERROR_TYPE, opts.errorType);
+    if (opts.errorStacktrace) {
+      const truncated =
+        opts.errorStacktrace.length > 8000
+          ? opts.errorStacktrace.slice(0, 8000)
+          : opts.errorStacktrace;
+      span.setAttribute(attrs.OBSERVATION_ERROR_STACKTRACE, truncated);
+    }
+    if (opts.errorHandled !== undefined && opts.errorHandled !== null)
+      span.setAttribute(attrs.OBSERVATION_ERROR_HANDLED, String(opts.errorHandled).toLowerCase());
     if (opts.usage) {
       span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(opts.usage));
+    }
+    if (opts.level === "ERROR" && opts.errorStacktrace) {
+      try {
+        (span as any).recordException?.(new Error(opts.statusMessage || "Error"));
+      } catch {}
     }
   }
 }
@@ -204,6 +222,8 @@ export function trace<T extends (...args: any[]) => any>(
                 return resolved;
               },
               (err: Error) => {
+                const errorType = err instanceof Error ? err.name : "Error";
+                const stack = err instanceof Error ? (err.stack ?? String(err)) : String(err);
                 setSpanAttributes(span, {
                   isRoot,
                   obsType,
@@ -213,10 +233,13 @@ export function trace<T extends (...args: any[]) => any>(
                   model,
                   metadata: staticMetadata,
                   level: "ERROR",
-                  statusMessage: err.message,
+                  statusMessage: err instanceof Error ? err.message : String(err),
                   userId,
                   sessionId,
                   usage,
+                  errorType,
+                  errorStacktrace: stack,
+                  errorHandled: false,
                 });
                 span.end();
                 throw err;
@@ -242,6 +265,8 @@ export function trace<T extends (...args: any[]) => any>(
           return result;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
+          const errorType = err instanceof Error ? err.name : "Error";
+          const stack = err instanceof Error ? (err.stack ?? String(err)) : String(err);
           setSpanAttributes(span, {
             isRoot,
             obsType,
@@ -255,6 +280,9 @@ export function trace<T extends (...args: any[]) => any>(
             userId,
             sessionId,
             usage,
+            errorType,
+            errorStacktrace: stack,
+            errorHandled: false,
           });
           span.end();
           throw err;

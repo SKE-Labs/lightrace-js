@@ -404,7 +404,16 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
         this.endRun(runId, null, "DEFAULT", null);
         return;
       }
-      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+      this.endRun(
+        runId,
+        null,
+        "ERROR",
+        error?.message ?? String(error),
+        undefined,
+        (error as any)?.name ?? "Error",
+        (error as any)?.stack ?? String(error),
+        false,
+      );
     } catch (e) {
       console.warn("[lightrace] Error in handleChainError:", e);
     }
@@ -619,7 +628,16 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
 
   async handleLLMError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
     try {
-      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+      this.endRun(
+        runId,
+        null,
+        "ERROR",
+        error?.message ?? String(error),
+        undefined,
+        (error as any)?.name ?? "Error",
+        (error as any)?.stack ?? String(error),
+        false,
+      );
       this.completionStartTimes.delete(runId);
     } catch (e) {
       console.warn("[lightrace] Error in handleLLMError:", e);
@@ -685,7 +703,16 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
 
   async handleToolError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
     try {
-      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+      this.endRun(
+        runId,
+        null,
+        "ERROR",
+        error?.message ?? String(error),
+        undefined,
+        (error as any)?.name ?? "Error",
+        (error as any)?.stack ?? String(error),
+        false,
+      );
     } catch (e) {
       console.warn("[lightrace] Error in handleToolError:", e);
     }
@@ -737,7 +764,16 @@ export class LightraceCallbackHandler extends BaseCallbackHandler {
 
   async handleRetrieverError(error: Error, runId: string, _parentRunId?: string): Promise<void> {
     try {
-      this.endRun(runId, null, "ERROR", error?.message ?? String(error));
+      this.endRun(
+        runId,
+        null,
+        "ERROR",
+        error?.message ?? String(error),
+        undefined,
+        (error as any)?.name ?? "Error",
+        (error as any)?.stack ?? String(error),
+        false,
+      );
     } catch (e) {
       console.warn("[lightrace] Error in handleRetrieverError:", e);
     }

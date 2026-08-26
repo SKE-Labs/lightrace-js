@@ -266,7 +266,16 @@ export class LightraceAgentHandler extends TracingMixin {
             output = fallbackOutput;
           }
           if (isError) {
-            this.endRun(toolRunId, output, "ERROR", String(output));
+            this.endRun(
+              toolRunId,
+              output,
+              "ERROR",
+              String(output),
+              undefined,
+              "ToolError",
+              String(output),
+              true,
+            );
           } else {
             this.endRun(toolRunId, output);
           }
@@ -302,7 +311,16 @@ export class LightraceAgentHandler extends TracingMixin {
 
     if (isError) {
       const errorMsg = raw.result ?? raw.subtype ?? "Agent error";
-      this.endRun(this.agentRunId, output, "ERROR", String(errorMsg), usage ?? undefined);
+      this.endRun(
+        this.agentRunId,
+        output,
+        "ERROR",
+        String(errorMsg),
+        usage ?? undefined,
+        "AgentError",
+        String(errorMsg),
+        false,
+      );
     } else {
       this.endRun(this.agentRunId, output, "DEFAULT", null, usage ?? undefined);
     }

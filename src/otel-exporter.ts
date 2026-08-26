@@ -26,6 +26,9 @@ export const OBSERVATION_LEVEL = "lightrace.observation.level";
 export const OBSERVATION_STATUS_MESSAGE = "lightrace.observation.status_message";
 export const OBSERVATION_INPUT = "lightrace.observation.input";
 export const OBSERVATION_OUTPUT = "lightrace.observation.output";
+export const OBSERVATION_ERROR_TYPE = "lightrace.observation.error_type";
+export const OBSERVATION_ERROR_STACKTRACE = "lightrace.observation.error_stacktrace";
+export const OBSERVATION_ERROR_HANDLED = "lightrace.observation.error_handled";
 
 export const OBSERVATION_COMPLETION_START_TIME = "lightrace.observation.completion_start_time";
 export const OBSERVATION_MODEL = "lightrace.observation.model";

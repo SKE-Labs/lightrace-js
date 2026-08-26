@@ -38,6 +38,9 @@ export class Observation {
   private usage: UsageDetails | undefined;
   private level: string = "DEFAULT";
   private statusMessage: string | undefined;
+  private errorType: string | undefined;
+  private errorStacktrace: string | undefined;
+  private errorHandled: boolean | undefined;
   private ended = false;
 
   constructor(opts: ObservationOptions) {
@@ -63,6 +66,9 @@ export class Observation {
     usage?: UsageDetails;
     level?: string;
     statusMessage?: string;
+    errorType?: string;
+    errorStacktrace?: string;
+    errorHandled?: boolean;
   }): this {
     if (fields.output !== undefined) this.output = fields.output;
     if (fields.metadata !== undefined) {
@@ -71,6 +77,13 @@ export class Observation {
     if (fields.usage !== undefined) this.usage = fields.usage;
     if (fields.level !== undefined) this.level = fields.level;
     if (fields.statusMessage !== undefined) this.statusMessage = fields.statusMessage;
+    if (fields.errorType !== undefined) this.errorType = fields.errorType;
+    if (fields.errorStacktrace !== undefined)
+      this.errorStacktrace =
+        fields.errorStacktrace.length > 8000
+          ? fields.errorStacktrace.slice(0, 8000)
+          : fields.errorStacktrace;
+    if (fields.errorHandled !== undefined) this.errorHandled = fields.errorHandled;
     return this;
   }
 
@@ -102,8 +115,28 @@ export class Observation {
     if (this.statusMessage) {
       span.setAttribute(attrs.OBSERVATION_STATUS_MESSAGE, this.statusMessage);
     }
+    if (this.errorType) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_TYPE, this.errorType);
+    }
+    if (this.errorStacktrace) {
+      span.setAttribute(
+        attrs.OBSERVATION_ERROR_STACKTRACE,
+        this.errorStacktrace.length > 8000
+          ? this.errorStacktrace.slice(0, 8000)
+          : this.errorStacktrace,
+      );
+    }
+    if (this.errorHandled !== undefined) {
+      span.setAttribute(attrs.OBSERVATION_ERROR_HANDLED, String(this.errorHandled).toLowerCase());
+    }
     if (this.usage) {
       span.setAttribute(attrs.OBSERVATION_USAGE_DETAILS, attrs.safeJson(this.usage));
+    }
+
+    if (this.level === "ERROR" && this.errorStacktrace) {
+      try {
+        (span as any).recordException?.(new Error(this.statusMessage || "Error"));
+      } catch {}
     }
 
     span.end();
